@@ -12,6 +12,8 @@ CodeRelay is a small TypeScript CLI that exposes a local workspace through MCP. 
 - Commands must be parsed and executed with `shell: false`.
 - Keep the MCP server bound to loopback.
 - Do not add a new tunnel provider without preserving the `TunnelProvider` interface.
+- Treat a Quick Tunnel URL as provisional until the public health check passes.
+- A public health-check timeout must not terminate a healthy local MCP server; keep the transport state visible as `starting` or `degraded`.
 - Automatic tunnel downloads must use a pinned official release and verify SHA256 before execution.
 - Prefer a user-installed `cloudflared` on `PATH` before the CodeRelay cache.
 

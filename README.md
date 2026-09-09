@@ -41,6 +41,8 @@ coderelay restart
 coderelay config show
 ```
 
+The public Quick Tunnel may need a short warm-up after its URL is created. CodeRelay waits with bounded exponential backoff and retries the tunnel once if the public health check remains unavailable. During that time, the local MCP server stays running; use `coderelay status` or `coderelay doctor` to distinguish the local server, the `cloudflared` process, and the public endpoint.
+
 For local development or security checks without a public endpoint:
 
 ```bash

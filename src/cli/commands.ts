@@ -1,7 +1,9 @@
+import { appendFile } from "node:fs/promises";
 import path from "node:path";
 import { detectWorkspace } from "../workspace/detect.js";
 import { runMcpServer } from "../mcp/server.js";
 import { CloudflaredTunnelProvider } from "../tunnel/cloudflared.js";
+import { waitForHealth, type HealthProbe } from "../tunnel/readiness.js";
 import {
   ensureGlobalStateDirectories,
   isProcessAlive,
@@ -63,13 +65,53 @@ async function ensureNoStaleRuntime(): Promise<void> {
   await removeRuntimeState();
 }
 
-async function waitForTunnel(provider: CloudflaredTunnelProvider, baseUrl: string, timeoutMs = 20_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await provider.healthCheck(baseUrl)) return;
-    await new Promise((resolve) => setTimeout(resolve, 300));
+async function logTunnelEvent(logPath: string, message: string): Promise<void> {
+  await appendFile(logPath, `[CodeRelay ${new Date().toISOString()}] ${message}\n`).catch(() => undefined);
+}
+
+async function waitForTunnel(
+  provider: CloudflaredTunnelProvider,
+  baseUrl: string,
+  logPath: string,
+  retryNumber: number
+): Promise<boolean> {
+  await logTunnelEvent(logPath, `tunnel URL created: ${baseUrl} (retry=${retryNumber})`);
+  const result = await waitForHealth(
+    () => provider.healthCheck(baseUrl),
+    {
+      onProbe: async (probe: HealthProbe) => {
+        await logTunnelEvent(
+          logPath,
+          `public health-check attempt=${probe.attempt} delay_ms=${probe.delayMs} healthy=${probe.healthy} elapsed_ms=${probe.elapsedMs} retry=${retryNumber}`
+        );
+      }
+    }
+  );
+  await logTunnelEvent(
+    logPath,
+    `public health-check finished ready=${result.ready} attempts=${result.attempts} elapsed_ms=${result.elapsedMs} retry=${retryNumber}`
+  );
+  return result.ready;
+}
+
+function transportState(state: RuntimeState): NonNullable<RuntimeState["transportState"]> {
+  if (state.transportState) return state.transportState;
+  return state.tunnelPid ? "ready" : "disabled";
+}
+
+async function refreshTransportState(state: RuntimeState, processAlive: boolean, publicHealthy: boolean): Promise<NonNullable<RuntimeState["transportState"]>> {
+  const nextState = !state.tunnelPid
+    ? "disabled"
+    : processAlive && publicHealthy
+      ? "ready"
+      : transportState(state) === "starting"
+        ? "starting"
+        : "degraded";
+  if (state.transportState !== nextState) {
+    state.transportState = nextState;
+    await writeRuntimeState(state);
   }
-  throw new Error(`Tunnel was created but its health endpoint is not reachable: ${baseUrl}/health`);
+  return nextState;
 }
 
 function printProjectDetection(info: Awaited<ReturnType<typeof detectWorkspace>>): void {
@@ -122,6 +164,23 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
   if (!serverPid) throw new Error("Could not start the local MCP server.");
   let tunnelPid = 0;
   let tunnelExecutable = "";
+  let tunnelProvider: CloudflaredTunnelProvider | undefined;
+  const state: RuntimeState = {
+    pid: serverPid,
+    tunnelPid,
+    transportState: useTunnel ? "starting" : "disabled",
+    workspace: workspaceInfo.root,
+    host,
+    port,
+    token,
+    tunnelProvider: "cloudflared",
+    tunnelExecutable: undefined,
+    tunnelBaseUrl: localBaseUrl(host, port),
+    endpoint: endpointFor(localBaseUrl(host, port), token),
+    startedAt: new Date().toISOString(),
+    serverLog,
+    tunnelLog: ""
+  };
 
   try {
     const localHealthUrl = `${localBaseUrl(host, port)}/health`;
@@ -133,40 +192,66 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
     let tunnelLog = "";
 
     if (useTunnel) {
-      const provider = new CloudflaredTunnelProvider();
-      const tunnel = await provider.start(port);
-      tunnelPid = tunnel.pid;
-      tunnelExecutable = tunnel.executablePath;
-      tunnelBaseUrl = tunnel.baseUrl;
-      tunnelLog = tunnel.logPath;
-      await waitForTunnel(provider, tunnelBaseUrl);
-      endpoint = endpointFor(tunnelBaseUrl, token);
-      console.log(`  ✓ Tunnel runtime: ${tunnelExecutable} (${tunnel.executableSource})`);
-      console.log("  ✓ Secure connection established");
+      tunnelProvider = new CloudflaredTunnelProvider();
+      for (let retryNumber = 0; retryNumber <= 1; retryNumber += 1) {
+        const tunnel = await tunnelProvider.start(port);
+        tunnelPid = tunnel.pid;
+        tunnelExecutable = tunnel.executablePath;
+        tunnelBaseUrl = tunnel.baseUrl;
+        tunnelLog = tunnel.logPath;
+        endpoint = endpointFor(tunnelBaseUrl, token);
+        state.tunnelPid = tunnelPid;
+        state.tunnelExecutable = tunnelExecutable;
+        state.tunnelBaseUrl = tunnelBaseUrl;
+        state.endpoint = endpoint;
+        state.tunnelLog = tunnelLog;
+        state.transportState = "starting";
+        await writeRuntimeState(state);
+
+        const ready = await waitForTunnel(tunnelProvider, tunnelBaseUrl, tunnelLog, retryNumber);
+        if (ready) {
+          state.transportState = "ready";
+          await writeRuntimeState(state);
+          console.log("  ✓ Secure connection ready");
+          break;
+        }
+
+        if (retryNumber === 0) {
+          await logTunnelEvent(tunnelLog, "stopping first tunnel after readiness timeout; retrying once");
+          await tunnelProvider.stop(tunnelPid);
+          tunnelPid = 0;
+          state.tunnelPid = 0;
+          state.transportState = "degraded";
+          await writeRuntimeState(state);
+          console.log("  ! Secure endpoint is still warming up; retrying the tunnel once.");
+          continue;
+        }
+
+        state.transportState = "degraded";
+        await writeRuntimeState(state);
+        console.log("  ! Secure endpoint is still warming up.");
+        console.log("    Local MCP is healthy.");
+        console.log("    Run coderelay doctor while the tunnel continues to connect.");
+      }
     } else {
       console.log("  ! Tunnel disabled; endpoint is local-only");
     }
 
-    const state: RuntimeState = {
-      pid: serverPid,
-      tunnelPid,
-      workspace: workspaceInfo.root,
-      host,
-      port,
-      token,
-      tunnelProvider: "cloudflared",
-      tunnelExecutable: tunnelExecutable || undefined,
-      tunnelBaseUrl,
-      endpoint,
-      startedAt: new Date().toISOString(),
-      serverLog,
-      tunnelLog
-    };
+    state.tunnelPid = tunnelPid;
+    state.tunnelExecutable = tunnelExecutable || undefined;
+    state.tunnelBaseUrl = tunnelBaseUrl;
+    state.endpoint = endpoint;
+    state.tunnelLog = tunnelLog;
+    if (!useTunnel) state.transportState = "disabled";
     await writeRuntimeState(state);
 
     console.log(`  ✓ Workspace config: ${configPath}`);
     console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    console.log("Your CodeRelay endpoint is ready:");
+    console.log(
+      transportState(state) === "degraded"
+        ? "Your local CodeRelay server is ready; the public endpoint is still warming up:"
+        : "Your CodeRelay endpoint is ready:"
+    );
     console.log(endpoint);
     console.log("\nChatGPT:");
     console.log("Settings → Plugins → + → Custom MCP");
@@ -222,12 +307,17 @@ export async function statusCommand(): Promise<void> {
   const tunnelAlive = !state.tunnelPid || isProcessAlive(state.tunnelPid);
   const serverReachable = await health(`${localBaseUrl(state.host, state.port)}/health`);
   const tunnelReachable = state.tunnelBaseUrl.startsWith("https://") ? await health(`${state.tunnelBaseUrl}/health`) : true;
+  const stateLabel = await refreshTransportState(state, tunnelAlive, tunnelReachable);
   console.log(`CodeRelay ${serverAlive && serverReachable ? "running" : "not healthy"}`);
   console.log(`Workspace: ${state.workspace}`);
   console.log(`MCP endpoint: ${state.endpoint}`);
-  if (state.tunnelExecutable) console.log(`Tunnel runtime: ${state.tunnelExecutable}`);
-  console.log(`Server: ${serverAlive && serverReachable ? "healthy" : "unavailable"}`);
-  console.log(`Tunnel: ${tunnelAlive && tunnelReachable ? "healthy" : "unavailable"}`);
+  console.log(`Transport: ${state.tunnelPid ? "cloudflared" : "disabled"}`);
+  console.log(`Transport state: ${stateLabel}`);
+  console.log(`Local MCP process: ${serverAlive ? "healthy" : "unavailable"}`);
+  console.log(`Local MCP /health: ${serverReachable ? "healthy" : "unavailable"}`);
+  console.log(`cloudflared process: ${state.tunnelPid ? (tunnelAlive ? "healthy" : "unavailable") : "disabled"}`);
+  console.log(`Public tunnel /health: ${state.tunnelPid ? (tunnelReachable ? "healthy" : "unavailable") : "disabled"}`);
+  if (state.tunnelExecutable) console.log(`Transport runtime: ${state.tunnelExecutable}`);
   console.log(`Started: ${state.startedAt}`);
 }
 
@@ -235,6 +325,7 @@ export async function doctorCommand(workspacePath = process.cwd()): Promise<void
   const state = await readRuntimeState();
   const workspace = state?.workspace ?? path.resolve(workspacePath);
   const checks: Array<{ label: string; ok: boolean; detail?: string }> = [];
+  let diagnosis: string | undefined;
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
   checks.push({ label: `Node.js ${process.versions.node}`, ok: nodeMajor >= 22, detail: "Node.js 22 or newer is required." });
   checks.push({ label: "Git available", ok: commandExists("git"), detail: "Install Git and retry." });
@@ -247,15 +338,27 @@ export async function doctorCommand(workspacePath = process.cwd()): Promise<void
   }
 
   if (state) {
-    checks.push({ label: "MCP server reachable", ok: await health(`${localBaseUrl(state.host, state.port)}/health`), detail: `Check ${state.serverLog}` });
+    const localProcessOk = isProcessAlive(state.pid);
+    const localHealthOk = await health(`${localBaseUrl(state.host, state.port)}/health`);
+    checks.push({ label: "Local MCP process", ok: localProcessOk, detail: `Check ${state.serverLog}` });
+    checks.push({ label: "Local MCP /health", ok: localHealthOk, detail: `Check ${state.serverLog}` });
     const provider = new CloudflaredTunnelProvider();
+    let publicHealthOk = false;
     const runtime = state.tunnelExecutable ? { path: state.tunnelExecutable } : await provider.runtime();
     if (state.tunnelPid) {
-      checks.push({ label: runtime ? `Tunnel runtime: ${runtime.path}` : "Tunnel runtime", ok: runtime !== null, detail: "CodeRelay will download a verified runtime on the next start." });
-      checks.push({ label: "HTTPS endpoint reachable", ok: state.tunnelBaseUrl.startsWith("https://") && await provider.healthCheck(state.tunnelBaseUrl), detail: `Check ${state.tunnelLog || "tunnel status"}` });
+      const tunnelProcessOk = isProcessAlive(state.tunnelPid);
+      publicHealthOk = state.tunnelBaseUrl.startsWith("https://") && await provider.healthCheck(state.tunnelBaseUrl);
+      await refreshTransportState(state, tunnelProcessOk, publicHealthOk);
+      checks.push({ label: runtime ? `cloudflared runtime: ${runtime.path}` : "cloudflared runtime", ok: runtime !== null, detail: "CodeRelay will download a verified runtime on the next start." });
+      checks.push({ label: "cloudflared process", ok: tunnelProcessOk, detail: `Check ${state.tunnelLog || "tunnel status"}` });
+      checks.push({ label: "Public tunnel /health", ok: publicHealthOk, detail: `Check ${state.tunnelLog || "tunnel status"}` });
     } else {
-      checks.push({ label: "Tunnel runtime (disabled)", ok: true });
-      checks.push({ label: "Public tunnel (disabled)", ok: true });
+      checks.push({ label: "cloudflared process (disabled)", ok: true });
+      checks.push({ label: "Public tunnel /health (disabled)", ok: true });
+    }
+
+    if (state.tunnelPid && localProcessOk && localHealthOk && !publicHealthOk) {
+      diagnosis = "Your local CodeRelay server is healthy.\nThe problem is between the Cloudflare edge and the local tunnel.";
     }
   } else {
     checks.push({ label: "CodeRelay runtime", ok: false, detail: "Run coderelay start first." });
@@ -266,6 +369,7 @@ export async function doctorCommand(workspacePath = process.cwd()): Promise<void
     console.log(`${check.ok ? "✓" : "✗"} ${check.label}`);
     if (!check.ok && check.detail) console.log(`  Suggested fix: ${check.detail}`);
   }
+  if (diagnosis) console.log(`\nDiagnosis:\n${diagnosis}`);
   console.log(checks.every((check) => check.ok) ? "\nEverything looks good." : "\nSome checks need attention.");
   if (checks.some((check) => !check.ok)) process.exitCode = 1;
 }

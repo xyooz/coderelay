@@ -110,6 +110,14 @@ describe("CodeRelay first-run MCP flow", () => {
       expect(endpoint).toBeTruthy();
       await waitForPath(path.join(coderelayHome, "runtime.json"));
 
+      const status = launchCli(["status"], coderelayHome);
+      const statusExit = await status.exit;
+      expect(statusExit.code).toBe(0);
+      expect(statusExit.stdout).toContain("Transport: disabled");
+      expect(statusExit.stdout).toContain("Transport state: disabled");
+      expect(statusExit.stdout).toContain("Local MCP process: healthy");
+      expect(statusExit.stdout).toContain("Local MCP /health: healthy");
+
       const initialized = await mcpCall(endpoint!, "initialize", {
         protocolVersion: "2025-06-18",
         capabilities: {},

@@ -13,6 +13,7 @@ export interface WorkspaceConfig {
 export interface RuntimeState {
   pid: number;
   tunnelPid: number;
+  transportState?: "disabled" | "starting" | "ready" | "degraded";
   workspace: string;
   host: string;
   port: number;

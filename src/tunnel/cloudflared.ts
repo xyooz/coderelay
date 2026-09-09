@@ -48,7 +48,9 @@ export class CloudflaredTunnelProvider implements TunnelProvider {
 
   async healthCheck(baseUrl: string): Promise<boolean> {
     try {
-      const response = await fetch(new URL("/health", baseUrl));
+      const response = await fetch(new URL("/health", baseUrl), {
+        signal: AbortSignal.timeout(5_000)
+      });
       return response.ok;
     } catch {
       return false;
