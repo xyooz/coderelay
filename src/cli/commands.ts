@@ -334,6 +334,11 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
 
         if (ready) break;
         if (candidateIndex < candidates.length - 1) {
+          if (transportProcess) {
+            await logTransportEvent(transportProcess.logPath, `stopping unavailable ${provider.name} transport before fallback`);
+            await provider.stop(transportProcess).catch(() => undefined);
+            transportProcess = undefined;
+          }
           console.log("  ! OpenAI Secure MCP Tunnel is unavailable; falling back to Cloudflare Quick Tunnel.");
           state.transportPid = 0;
           state.transportState = "starting";
