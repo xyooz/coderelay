@@ -6,10 +6,12 @@ No API key. No copy-paste. No manual MCP configuration.
 
 ```bash
 cd your-project
-npx coderelay
+# One-time install (or use `npx coderelay` without installing globally)
+npm install --global coderelay
+coderelay
 ```
 
-Then add the printed MCP endpoint to ChatGPT and ask:
+CodeRelay binds one isolated instance to the current workspace. When OpenAI Secure MCP Tunnel is configured, it starts the official `tunnel-client` automatically; otherwise it uses a Cloudflare Quick Tunnel. Then ask ChatGPT:
 
 > Analyze this project and tell me how it is structured.
 
@@ -27,13 +29,31 @@ CodeRelay gives ChatGPT a small, safe toolset for your current repository:
 - Git
 - Internet access on first start so CodeRelay can download its tunnel runtime
 
-CodeRelay uses a Cloudflare Quick Tunnel. It does not require a Cloudflare account, API key, `sudo`, or a package manager. If `cloudflared` is already on `PATH`, CodeRelay uses it; otherwise it downloads a verified platform binary into `~/.coderelay/bin/` and reuses it on later starts. The tunnel URL is temporary and changes when CodeRelay restarts.
+CodeRelay prefers OpenAI Secure MCP Tunnel when `CONTROL_PLANE_TUNNEL_ID`, `CONTROL_PLANE_API_KEY`, and `tunnel-client` are available. The API key is read only from the environment and is never written to the project or runtime state. Install the official client from OpenAI Platform Tunnels or set `CODERELAY_TUNNEL_CLIENT` to its path.
+
+For OpenAI Secure MCP Tunnel, configure the official client once in your shell, then run CodeRelay normally:
+
+```bash
+export CONTROL_PLANE_TUNNEL_ID="tunnel_..."
+export CONTROL_PLANE_API_KEY="sk-..." # restricted runtime key with Tunnels Read + Use
+coderelay
+```
+
+If OpenAI Secure MCP Tunnel is not configured, CodeRelay falls back to a Cloudflare Quick Tunnel. It does not require a Cloudflare account, API key, `sudo`, or a package manager. If `cloudflared` is already on `PATH`, CodeRelay uses it; otherwise it downloads a verified platform binary into `~/.coderelay/bin/` and reuses it on later starts.
 
 ## Commands
 
 ```bash
 coderelay              # same as coderelay start
 coderelay start
+coderelay ~/Projects/a
+coderelay --name attendance-client
+coderelay --transport openai
+coderelay --transport cloudflare
+coderelay list
+coderelay status project-a
+coderelay stop project-a
+coderelay restart project-a
 coderelay stop
 coderelay status
 coderelay doctor
@@ -43,7 +63,14 @@ coderelay config show
 
 The public Quick Tunnel may need a short warm-up after its URL is created. CodeRelay waits with bounded exponential backoff and retries the tunnel once if the public health check remains unavailable. During that time, the local MCP server stays running; use `coderelay status` or `coderelay doctor` to distinguish the local server, the `cloudflared` process, and the public endpoint.
 
-For local development or security checks without a public endpoint:
+The first run stores non-sensitive project settings in `.coderelay/config.json`. Runtime state and logs are isolated per instance:
+
+```text
+~/.coderelay/instances/<instance-name>/runtime.json
+~/.coderelay/instances/<instance-name>/logs/
+```
+
+For local development or security checks without a tunnel:
 
 ```bash
 coderelay start --no-tunnel
@@ -71,13 +98,7 @@ The current workspace receives:
 .coderelay/config.json
 ```
 
-Runtime state and logs live outside the repository:
-
-```text
-~/.coderelay/runtime.json
-~/.coderelay/logs/
-~/.coderelay/bin/cloudflared
-```
+Runtime state and logs live outside the repository. Multiple workspaces can run concurrently because each instance has its own MCP port, process state, logs, and transport.
 
 The workspace `.coderelay/` directory is ignored by Git.
 
@@ -88,7 +109,7 @@ ChatGPT
    │
    │ MCP
    ▼
-CodeRelay
+CodeRelay — project-a
    │
    ├── Read / Edit
    ├── Search
@@ -101,8 +122,8 @@ Your Repository
 
 ```text
 Local server:     127.0.0.1
-Public access:    temporary Cloudflare Quick Tunnel
-Workspace access: current repository only
+Transport:        OpenAI Secure MCP Tunnel or Cloudflare Quick Tunnel
+Workspace access: one isolated workspace per instance
 ```
 
 ## Development

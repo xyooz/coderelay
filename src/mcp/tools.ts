@@ -18,6 +18,7 @@ const MAX_LIST_RESULTS = 2_000;
 
 export interface ToolContext {
   workspaceRoot: string;
+  instanceName: string;
 }
 
 type ToolResponse = {
@@ -32,6 +33,10 @@ function success(text: string): ToolResponse {
 function failure(error: unknown): ToolResponse {
   const message = error instanceof Error ? error.message : String(error);
   return { content: [{ type: "text", text: message }], isError: true };
+}
+
+function scopedDescription(context: ToolContext, description: string): string {
+  return `${description} Active CodeRelay instance: ${context.instanceName}. Workspace root: ${context.workspaceRoot}. Paths outside this workspace are inaccessible.`;
 }
 
 async function guarded<T>(operation: () => Promise<T>, format: (value: T) => string): Promise<ToolResponse> {
@@ -233,7 +238,7 @@ export function createMcpServer(context: ToolContext): McpServer {
   server.registerTool(
     "list_files",
     {
-      description: "List files and directories inside the CodeRelay workspace.",
+      description: scopedDescription(context, "List files and directories inside the CodeRelay workspace."),
       inputSchema: z.object({
         path: z.string().default("."),
         depth: z.number().int().min(0).max(20).default(3),
@@ -249,7 +254,7 @@ export function createMcpServer(context: ToolContext): McpServer {
   server.registerTool(
     "read_file",
     {
-      description: "Read a UTF-8 text file inside the CodeRelay workspace. Sensitive files are blocked.",
+      description: scopedDescription(context, "Read a UTF-8 text file inside the CodeRelay workspace. Sensitive files are blocked."),
       inputSchema: z.object({
         path: z.string(),
         max_bytes: z.number().int().min(1).max(MAX_FILE_BYTES).default(MAX_FILE_BYTES)
@@ -264,7 +269,7 @@ export function createMcpServer(context: ToolContext): McpServer {
   server.registerTool(
     "search_code",
     {
-      description: "Search text in workspace files without reading blocked sensitive files.",
+      description: scopedDescription(context, "Search text in workspace files without reading blocked sensitive files."),
       inputSchema: z.object({
         query: z.string(),
         path: z.string().default("."),
@@ -281,7 +286,7 @@ export function createMcpServer(context: ToolContext): McpServer {
   server.registerTool(
     "write_file",
     {
-      description: "Create or replace a UTF-8 text file inside the workspace.",
+      description: scopedDescription(context, "Create or replace a UTF-8 text file inside the workspace."),
       inputSchema: z.object({ path: z.string(), content: z.string() })
     },
     async ({ path: requestedPath, content }) => guarded(
@@ -293,7 +298,7 @@ export function createMcpServer(context: ToolContext): McpServer {
   server.registerTool(
     "edit_file",
     {
-      description: "Replace an exact text fragment in a workspace file.",
+      description: scopedDescription(context, "Replace an exact text fragment in a workspace file."),
       inputSchema: z.object({
         path: z.string(),
         old_text: z.string(),
@@ -310,7 +315,7 @@ export function createMcpServer(context: ToolContext): McpServer {
   server.registerTool(
     "run_command",
     {
-      description: "Run a shell-free command from the workspace. Dangerous commands and workspace escapes are blocked.",
+      description: scopedDescription(context, "Run a shell-free command from the workspace. Dangerous commands and workspace escapes are blocked."),
       inputSchema: z.object({
         command: z.string(),
         timeout_ms: z.number().int().min(1_000).max(120_000).default(120_000)
@@ -329,7 +334,7 @@ export function createMcpServer(context: ToolContext): McpServer {
   server.registerTool(
     "git_diff",
     {
-      description: "Show the current Git diff for the workspace.",
+      description: scopedDescription(context, "Show the current Git diff for the workspace."),
       inputSchema: z.object({ path: z.string().optional(), cached: z.boolean().default(false) })
     },
     async ({ path: requestedPath, cached }) => guarded(

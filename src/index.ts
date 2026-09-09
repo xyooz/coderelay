@@ -1,7 +1,8 @@
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import {
   configShowCommand,
   doctorCommand,
+  listCommand,
   restartCommand,
   serveCommand,
   startCommand,
@@ -18,42 +19,57 @@ program
 program
   .command("start")
   .description("Start the local MCP server and tunnel")
-  .option("--workspace <path>", "workspace directory", process.cwd())
+  .argument("[workspace]", "workspace directory", process.cwd())
+  .option("--workspace <path>", "workspace directory (legacy alias)")
+  .option("--name <name>", "instance name")
+  .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare"]))
   .option("--port <number>", "preferred local port", (value) => Number.parseInt(value, 10))
   .option("--no-tunnel", "start locally without a public tunnel")
-  .action(async (options: { workspace: string; port?: number; tunnel?: boolean }) => startCommand(options));
+  .action(async (workspace: string | undefined, options: { workspace?: string; name?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => startCommand({ ...options, workspace: options.workspace ?? workspace }));
 
 program
   .command("serve", { hidden: true })
   .requiredOption("--workspace <path>", "workspace directory")
+  .requiredOption("--instance-name <name>", "instance name")
   .requiredOption("--host <host>", "bind host")
   .requiredOption("--port <number>", "local port", (value) => Number.parseInt(value, 10))
   .requiredOption("--token <token>", "endpoint token")
-  .action(async (options: { workspace: string; host: string; port: number; token: string }) => serveCommand(options));
+  .action(async (options: { workspace: string; instanceName: string; host: string; port: number; token: string }) => serveCommand(options));
 
 program
   .command("stop")
   .description("Stop CodeRelay and its tunnel")
-  .action(stopCommand);
+  .argument("[instanceName]", "instance name")
+  .action(async (instanceName?: string) => stopCommand(instanceName));
 
 program
   .command("status")
   .description("Show server and tunnel status")
-  .action(statusCommand);
+  .argument("[instanceName]", "instance name")
+  .action(async (instanceName?: string) => statusCommand(instanceName));
+
+program
+  .command("list")
+  .description("List CodeRelay instances")
+  .action(listCommand);
 
 program
   .command("doctor")
   .description("Diagnose local setup and connectivity")
+  .argument("[instanceName]", "instance name")
   .option("--workspace <path>", "workspace directory", process.cwd())
-  .action(async (options: { workspace: string }) => doctorCommand(options.workspace));
+  .action(async (instanceName: string | undefined, options: { workspace: string }) => doctorCommand(options.workspace, instanceName));
 
 program
   .command("restart")
   .description("Restart CodeRelay")
-  .option("--workspace <path>", "workspace directory", process.cwd())
+  .argument("[instanceName]", "instance name")
+  .option("--workspace <path>", "workspace directory")
+  .option("--name <name>", "instance name override")
+  .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare"]))
   .option("--port <number>", "preferred local port", (value) => Number.parseInt(value, 10))
   .option("--no-tunnel", "restart locally without a public tunnel")
-  .action(async (options: { workspace: string; port?: number; tunnel?: boolean }) => restartCommand(options));
+  .action(async (instanceName: string | undefined, options: { workspace?: string; name?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => restartCommand(instanceName, options));
 
 program
   .command("config")
@@ -63,7 +79,9 @@ program
   .action(async (options: { workspace: string }) => configShowCommand(options.workspace));
 
 const args = process.argv.slice(2);
+const commands = new Set(["start", "serve", "stop", "status", "list", "doctor", "restart", "config"]);
 if (args.length === 0) args.push("start");
+else if (!commands.has(args[0]) && !["--help", "-h", "--version", "-V"].includes(args[0])) args.unshift("start");
 
 program.parseAsync([process.argv[0], process.argv[1], ...args]).catch((error: unknown) => {
   console.error(`CodeRelay error: ${error instanceof Error ? error.message : String(error)}`);

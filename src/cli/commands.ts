@@ -3,18 +3,29 @@ import path from "node:path";
 import { detectWorkspace } from "../workspace/detect.js";
 import { runMcpServer } from "../mcp/server.js";
 import { CloudflaredTunnelProvider } from "../tunnel/cloudflared.js";
+import { OpenAiTunnelProvider, resolveTunnelClient } from "../tunnel/openai.js";
+import { selectTransport, type TransportPreference } from "../tunnel/selection.js";
 import { waitForHealth, type HealthProbe } from "../tunnel/readiness.js";
+import type { TunnelProcess, TunnelProvider, TunnelStartContext } from "../tunnel/provider.js";
 import {
+  defaultInstanceName,
   ensureGlobalStateDirectories,
+  findRuntimeStateForWorkspace,
+  instanceLogPath,
   isProcessAlive,
+  listInstanceRecords,
+  listRuntimeStates,
+  normalizeInstanceName,
   readRuntimeState,
   readWorkspaceConfig,
+  removeInstanceRecord,
   removeRuntimeState,
+  writeInstanceRecord,
   writeRuntimeState,
   writeWorkspaceConfig,
   type RuntimeState,
   type WorkspaceConfig,
-  LOG_PATH
+  type TransportProviderName
 } from "../runtime/state.js";
 import {
   commandExists,
@@ -26,14 +37,17 @@ import {
   waitForHttp
 } from "../runtime/process.js";
 
-interface StartOptions {
+export interface StartOptions {
   workspace?: string;
+  name?: string;
   port?: number;
+  transport?: TransportPreference;
   tunnel?: boolean;
 }
 
 interface ServeOptions {
   workspace: string;
+  instanceName: string;
   host: string;
   port: number;
   token: string;
@@ -56,53 +70,70 @@ function serverChildCommand(args: string[]): { command: string; args: string[] }
   return { command: process.execPath, args: [entryPoint, ...args] };
 }
 
-async function ensureNoStaleRuntime(): Promise<void> {
-  const state = await readRuntimeState();
-  if (!state) return;
-  if (isProcessAlive(state.pid)) {
-    throw new Error(`CodeRelay is already running for ${state.workspace}. Run coderelay status or coderelay stop first.`);
-  }
-  await removeRuntimeState();
+function configuredTransport(config: WorkspaceConfig | null): TransportPreference {
+  if (config?.transport) return config.transport;
+  return "auto";
 }
 
-async function logTunnelEvent(logPath: string, message: string): Promise<void> {
+async function resolveInstanceName(workspace: string, requestedName: string | undefined, config: WorkspaceConfig | null): Promise<string> {
+  const configuredName = !requestedName ? config?.instanceName : undefined;
+  const baseName = normalizeInstanceName(requestedName ?? configuredName ?? defaultInstanceName(workspace));
+  const records = await listInstanceRecords();
+  const states = await listRuntimeStates();
+  const occupied = new Set([
+    ...records.filter((record) => path.resolve(record.workspace) !== path.resolve(workspace)).map((record) => record.instanceName),
+    ...states.filter((state) => path.resolve(state.workspace) !== path.resolve(workspace)).map((state) => state.instanceName)
+  ]);
+  if (!occupied.has(baseName)) return baseName;
+
+  let suffix = 2;
+  while (occupied.has(`${baseName}-${suffix}`)) suffix += 1;
+  return `${baseName}-${suffix}`;
+}
+
+async function ensureNoStaleRuntime(workspace: string, instanceName: string): Promise<void> {
+  const state = (await readRuntimeState(instanceName)) ?? await findRuntimeStateForWorkspace(workspace);
+  if (!state) return;
+  if (isProcessAlive(state.pid)) {
+    throw new Error(`CodeRelay instance ${state.instanceName} is already running for ${state.workspace}. Run coderelay status ${state.instanceName} or coderelay stop ${state.instanceName} first.`);
+  }
+  await removeRuntimeState(state.instanceName);
+}
+
+async function logTransportEvent(logPath: string, message: string): Promise<void> {
+  if (!logPath) return;
   await appendFile(logPath, `[CodeRelay ${new Date().toISOString()}] ${message}\n`).catch(() => undefined);
 }
 
-async function waitForTunnel(
-  provider: CloudflaredTunnelProvider,
-  baseUrl: string,
-  logPath: string,
-  retryNumber: number
-): Promise<boolean> {
-  await logTunnelEvent(logPath, `tunnel URL created: ${baseUrl} (retry=${retryNumber})`);
+async function waitForTransport(provider: TunnelProvider, tunnel: TunnelProcess, retryNumber: number): Promise<boolean> {
+  await logTransportEvent(tunnel.logPath, `transport started provider=${provider.name} tunnel_id=${tunnel.tunnelId ?? ""} retry=${retryNumber}`);
   const result = await waitForHealth(
-    () => provider.healthCheck(baseUrl),
+    () => provider.healthCheck(tunnel),
     {
       onProbe: async (probe: HealthProbe) => {
-        await logTunnelEvent(
-          logPath,
-          `public health-check attempt=${probe.attempt} delay_ms=${probe.delayMs} healthy=${probe.healthy} elapsed_ms=${probe.elapsedMs} retry=${retryNumber}`
+        await logTransportEvent(
+          tunnel.logPath,
+          `transport health-check provider=${provider.name} attempt=${probe.attempt} delay_ms=${probe.delayMs} healthy=${probe.healthy} elapsed_ms=${probe.elapsedMs} retry=${retryNumber}`
         );
       }
     }
   );
-  await logTunnelEvent(
-    logPath,
-    `public health-check finished ready=${result.ready} attempts=${result.attempts} elapsed_ms=${result.elapsedMs} retry=${retryNumber}`
+  await logTransportEvent(
+    tunnel.logPath,
+    `transport health-check finished provider=${provider.name} ready=${result.ready} attempts=${result.attempts} elapsed_ms=${result.elapsedMs} retry=${retryNumber}`
   );
   return result.ready;
 }
 
 function transportState(state: RuntimeState): NonNullable<RuntimeState["transportState"]> {
   if (state.transportState) return state.transportState;
-  return state.tunnelPid ? "ready" : "disabled";
+  return state.transportPid ? "ready" : "disabled";
 }
 
-async function refreshTransportState(state: RuntimeState, processAlive: boolean, publicHealthy: boolean): Promise<NonNullable<RuntimeState["transportState"]>> {
-  const nextState = !state.tunnelPid
+async function refreshTransportState(state: RuntimeState, processAlive: boolean, transportHealthy: boolean): Promise<NonNullable<RuntimeState["transportState"]>> {
+  const nextState = state.transportProvider === "disabled"
     ? "disabled"
-    : processAlive && publicHealthy
+    : processAlive && transportHealthy
       ? "ready"
       : transportState(state) === "starting"
         ? "starting"
@@ -114,155 +145,217 @@ async function refreshTransportState(state: RuntimeState, processAlive: boolean,
   return nextState;
 }
 
+function processFromState(state: RuntimeState): TunnelProcess {
+  return {
+    provider: state.transportProvider === "openai" ? "openai" : "cloudflare",
+    pid: state.transportPid,
+    baseUrl: state.transportBaseUrl,
+    healthUrl: state.transportHealthUrl,
+    tunnelId: state.openaiTunnelId,
+    logPath: state.transportLog,
+    executablePath: state.transportExecutable ?? "",
+    executableSource: "path",
+    executableVersion: "unknown"
+  };
+}
+
+function providerFor(name: TransportProviderName): TunnelProvider {
+  return name === "openai" ? new OpenAiTunnelProvider() : new CloudflaredTunnelProvider();
+}
+
 function printProjectDetection(info: Awaited<ReturnType<typeof detectWorkspace>>): void {
   console.log("Detected project:");
   console.log(info.isGitRepository ? "  ✓ Git repository" : "  ! Git repository not detected");
   for (const technology of info.technologies) console.log(`  ✓ ${technology}`);
-  if (info.technologies.length === 0 && info.markers.length > 0) {
-    console.log(`  ✓ ${info.markers.join(", ")}`);
+  if (info.technologies.length === 0 && info.markers.length > 0) console.log(`  ✓ ${info.markers.join(", ")}`);
+}
+
+function printReadyMessage(state: RuntimeState, configPath: string): void {
+  console.log(`  ✓ Instance: ${state.instanceName}`);
+  console.log(`  ✓ Workspace config: ${configPath}`);
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  if (state.transportProvider === "openai") {
+    console.log(state.transportState === "ready" ? "Your CodeRelay Secure MCP Tunnel is ready:" : "Your local CodeRelay server is ready; the Secure MCP Tunnel is still warming up:");
+    console.log("Transport: OpenAI Secure MCP Tunnel");
+    console.log(`Tunnel ID: ${state.openaiTunnelId ?? "not available"}`);
+    console.log(`ChatGPT app: CodeRelay — ${state.instanceName}`);
+    console.log("Keep this process running while using the ChatGPT app.");
+  } else if (state.transportProvider === "cloudflare") {
+    console.log(state.transportState === "degraded" ? "Your local CodeRelay server is ready; the public endpoint is still warming up:" : "Your CodeRelay endpoint is ready:");
+    console.log(state.endpoint);
+    console.log("\nChatGPT:");
+    console.log("Settings → Plugins → + → Custom MCP");
+    console.log("Paste the endpoint above.");
+  } else {
+    console.log("Your CodeRelay endpoint is ready:");
+    console.log(state.endpoint);
+    console.log("\nTunnel disabled; this endpoint is local-only.");
   }
+  console.log('\nThen ask: "Inspect this repository and run its tests."');
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log(`\nRun coderelay doctor ${state.instanceName} if anything looks wrong.`);
 }
 
 export async function startCommand(options: StartOptions = {}): Promise<void> {
-  await ensureNoStaleRuntime();
   const workspaceInfo = await detectWorkspace(options.workspace ?? process.cwd());
   const previousConfig = await readWorkspaceConfig(workspaceInfo.root);
+  const instanceName = await resolveInstanceName(workspaceInfo.root, options.name, previousConfig);
+  await ensureNoStaleRuntime(workspaceInfo.root, instanceName);
+  const previousRecord = (await listInstanceRecords()).find((record) => path.resolve(record.workspace) === path.resolve(workspaceInfo.root) && record.instanceName !== instanceName);
+  if (previousRecord) await removeInstanceRecord(previousRecord.instanceName);
+
   const host = previousConfig?.host ?? "127.0.0.1";
   const preferredPort = options.port ?? previousConfig?.port ?? 7676;
   const port = await findAvailablePort(preferredPort, host);
   const useTunnel = options.tunnel !== false;
+  const preference = options.transport ?? configuredTransport(previousConfig);
+  const openaiTunnelId = process.env.CONTROL_PLANE_TUNNEL_ID ?? previousConfig?.openaiTunnelId;
   const config: WorkspaceConfig = {
     workspace: workspaceInfo.root,
     host,
     port,
     safeMode: true,
-    tunnelProvider: "cloudflared"
+    instanceName,
+    transport: preference,
+    openaiTunnelId
   };
   const configPath = await writeWorkspaceConfig(config);
   await ensureGlobalStateDirectories();
+  await writeInstanceRecord({ instanceName, workspace: workspaceInfo.root, transport: preference, openaiTunnelId, updatedAt: new Date().toISOString() });
 
   printProjectDetection(workspaceInfo);
+  console.log(`  ✓ Instance: ${instanceName}`);
   console.log(`  ✓ Workspace: ${workspaceInfo.root}`);
   console.log(`  ✓ Node.js ${process.versions.node}`);
 
   const token = randomToken();
   const timestamp = new Date().toISOString().replace(/[:.]/gu, "-");
-  const serverLog = path.join(LOG_PATH, `server-${timestamp}.log`);
+  const logDirectory = instanceLogPath(instanceName);
+  const serverLog = path.join(logDirectory, `server-${timestamp}.log`);
   const serverCommand = serverChildCommand([
     "serve",
-    "--workspace",
-    workspaceInfo.root,
-    "--host",
-    host,
-    "--port",
-    String(port),
-    "--token",
-    token
+    "--workspace", workspaceInfo.root,
+    "--instance-name", instanceName,
+    "--host", host,
+    "--port", String(port),
+    "--token", token
   ]);
   const serverProcess = spawnDetachedProcess(serverCommand.command, serverCommand.args, serverLog, workspaceInfo.root);
   const serverPid = serverProcess.pid;
   if (!serverPid) throw new Error("Could not start the local MCP server.");
-  let tunnelPid = 0;
-  let tunnelExecutable = "";
-  let tunnelProvider: CloudflaredTunnelProvider | undefined;
+
+  const localBase = localBaseUrl(host, port);
+  const localEndpoint = endpointFor(localBase, token);
   const state: RuntimeState = {
+    instanceName,
     pid: serverPid,
-    tunnelPid,
+    transportPid: 0,
     transportState: useTunnel ? "starting" : "disabled",
     workspace: workspaceInfo.root,
     host,
     port,
     token,
-    tunnelProvider: "cloudflared",
-    tunnelExecutable: undefined,
-    tunnelBaseUrl: localBaseUrl(host, port),
-    endpoint: endpointFor(localBaseUrl(host, port), token),
+    transportProvider: "disabled",
+    openaiTunnelId,
+    endpoint: localEndpoint,
     startedAt: new Date().toISOString(),
     serverLog,
-    tunnelLog: ""
+    transportLog: ""
   };
 
+  let localReady = false;
+  let transportProcess: TunnelProcess | undefined;
   try {
-    const localHealthUrl = `${localBaseUrl(host, port)}/health`;
-    await waitForHttp(localHealthUrl);
+    await waitForHttp(`${localBase}/health`);
+    localReady = true;
     console.log("  ✓ MCP server started");
-
-    let tunnelBaseUrl = localBaseUrl(host, port);
-    let endpoint = endpointFor(tunnelBaseUrl, token);
-    let tunnelLog = "";
+    await writeRuntimeState(state);
 
     if (useTunnel) {
-      tunnelProvider = new CloudflaredTunnelProvider();
-      for (let retryNumber = 0; retryNumber <= 1; retryNumber += 1) {
-        const tunnel = await tunnelProvider.start(port);
-        tunnelPid = tunnel.pid;
-        tunnelExecutable = tunnel.executablePath;
-        tunnelBaseUrl = tunnel.baseUrl;
-        tunnelLog = tunnel.logPath;
-        endpoint = endpointFor(tunnelBaseUrl, token);
-        state.tunnelPid = tunnelPid;
-        state.tunnelExecutable = tunnelExecutable;
-        state.tunnelBaseUrl = tunnelBaseUrl;
-        state.endpoint = endpoint;
-        state.tunnelLog = tunnelLog;
+      const context: TunnelStartContext = {
+        localPort: port,
+        localEndpoint,
+        workspace: workspaceInfo.root,
+        instanceName,
+        openaiTunnelId
+      };
+      const selected = await selectTransport(preference, context);
+      const candidates: TunnelProvider[] = [selected];
+      if (preference === "auto" && selected.name === "openai") candidates.push(new CloudflaredTunnelProvider());
+
+      for (const [candidateIndex, provider] of candidates.entries()) {
+        state.transportProvider = provider.name;
         state.transportState = "starting";
         await writeRuntimeState(state);
+        const maxRetries = provider.name === "cloudflare" ? 1 : 0;
+        let ready = false;
 
-        const ready = await waitForTunnel(tunnelProvider, tunnelBaseUrl, tunnelLog, retryNumber);
-        if (ready) {
-          state.transportState = "ready";
-          await writeRuntimeState(state);
-          console.log("  ✓ Secure connection ready");
-          break;
+        for (let retryNumber = 0; retryNumber <= maxRetries; retryNumber += 1) {
+          try {
+            transportProcess = await provider.start(context);
+            state.transportPid = transportProcess.pid;
+            state.transportExecutable = transportProcess.executablePath;
+            state.transportBaseUrl = transportProcess.baseUrl;
+            state.transportHealthUrl = transportProcess.healthUrl;
+            state.openaiTunnelId = transportProcess.tunnelId ?? state.openaiTunnelId;
+            state.endpoint = transportProcess.baseUrl ? endpointFor(transportProcess.baseUrl, token) : `openai://tunnel/${state.openaiTunnelId ?? "unknown"}`;
+            state.transportLog = transportProcess.logPath;
+            await writeRuntimeState(state);
+
+            ready = await waitForTransport(provider, transportProcess, retryNumber);
+            if (ready) {
+              state.transportState = "ready";
+              await writeRuntimeState(state);
+              console.log("  ✓ Secure connection ready");
+              break;
+            }
+
+            if (retryNumber < maxRetries) {
+              await logTransportEvent(transportProcess.logPath, "stopping transport after readiness timeout; retrying once");
+              await provider.stop(transportProcess);
+              transportProcess = undefined;
+              state.transportPid = 0;
+              state.transportState = "degraded";
+              await writeRuntimeState(state);
+              console.log("  ! Secure endpoint is still warming up; retrying the Cloudflare tunnel once.");
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            await logTransportEvent(state.transportLog, `transport startup failed provider=${provider.name}: ${message}`);
+            if (transportProcess) await provider.stop(transportProcess).catch(() => undefined);
+            transportProcess = undefined;
+            state.transportPid = 0;
+            state.transportState = "degraded";
+            await writeRuntimeState(state);
+            console.log(`  ! ${provider.name} transport did not start: ${message}`);
+            break;
+          }
         }
 
-        if (retryNumber === 0) {
-          await logTunnelEvent(tunnelLog, "stopping first tunnel after readiness timeout; retrying once");
-          await tunnelProvider.stop(tunnelPid);
-          tunnelPid = 0;
-          state.tunnelPid = 0;
-          state.transportState = "degraded";
+        if (ready) break;
+        if (candidateIndex < candidates.length - 1) {
+          console.log("  ! OpenAI Secure MCP Tunnel is unavailable; falling back to Cloudflare Quick Tunnel.");
+          state.transportPid = 0;
+          state.transportState = "starting";
           await writeRuntimeState(state);
-          console.log("  ! Secure endpoint is still warming up; retrying the tunnel once.");
           continue;
         }
-
         state.transportState = "degraded";
         await writeRuntimeState(state);
-        console.log("  ! Secure endpoint is still warming up.");
-        console.log("    Local MCP is healthy.");
-        console.log("    Run coderelay doctor while the tunnel continues to connect.");
       }
     } else {
       console.log("  ! Tunnel disabled; endpoint is local-only");
     }
 
-    state.tunnelPid = tunnelPid;
-    state.tunnelExecutable = tunnelExecutable || undefined;
-    state.tunnelBaseUrl = tunnelBaseUrl;
-    state.endpoint = endpoint;
-    state.tunnelLog = tunnelLog;
-    if (!useTunnel) state.transportState = "disabled";
+    state.transportPid = transportProcess?.pid ?? state.transportPid;
+    state.transportLog = transportProcess?.logPath ?? state.transportLog;
+    if (!useTunnel) state.transportProvider = "disabled";
     await writeRuntimeState(state);
-
-    console.log(`  ✓ Workspace config: ${configPath}`);
-    console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    console.log(
-      transportState(state) === "degraded"
-        ? "Your local CodeRelay server is ready; the public endpoint is still warming up:"
-        : "Your CodeRelay endpoint is ready:"
-    );
-    console.log(endpoint);
-    console.log("\nChatGPT:");
-    console.log("Settings → Plugins → + → Custom MCP");
-    console.log("Paste the endpoint above.");
-    console.log('\nThen ask: "Inspect this repository and run its tests."');
-    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    console.log("\nRun coderelay doctor if anything looks wrong.");
+    printReadyMessage(state, configPath);
   } catch (error) {
-    await terminateProcess(tunnelPid);
-    await terminateProcess(serverPid);
-    await removeRuntimeState();
+    if (transportProcess) await providerFor(transportProcess.provider).stop(transportProcess).catch(() => undefined);
+    if (localReady) await terminateProcess(serverPid);
+    await removeRuntimeState(instanceName);
     throw error;
   }
 }
@@ -270,59 +363,94 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
 export async function serveCommand(options: ServeOptions): Promise<void> {
   await runMcpServer({
     workspaceRoot: path.resolve(options.workspace),
+    instanceName: options.instanceName,
     host: options.host,
     port: options.port,
     token: options.token
   });
 }
 
-export async function stopCommand(): Promise<void> {
-  const state = await readRuntimeState();
+async function stateFor(instanceName: string | undefined, workspacePath = process.cwd()): Promise<RuntimeState | null> {
+  if (instanceName) return (await readRuntimeState(instanceName)) ?? await findRuntimeStateForWorkspace(instanceName);
+  return await findRuntimeStateForWorkspace(workspacePath) ?? await readRuntimeState();
+}
+
+export async function stopCommand(instanceName?: string, workspacePath = process.cwd()): Promise<void> {
+  const state = await stateFor(instanceName, workspacePath);
   if (!state) {
     console.log("CodeRelay is not running.");
     return;
   }
-  await terminateProcess(state.tunnelPid);
+  if (state.transportPid) await providerFor(state.transportProvider === "openai" ? "openai" : "cloudflare").stop(processFromState(state));
   await terminateProcess(state.pid);
-  await removeRuntimeState();
-  console.log(`Stopped CodeRelay for ${state.workspace}.`);
+  await removeRuntimeState(state.instanceName);
+  console.log(`Stopped CodeRelay instance ${state.instanceName} for ${state.workspace}.`);
 }
 
 async function health(url: string): Promise<boolean> {
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
     return response.ok;
   } catch {
     return false;
   }
 }
 
-export async function statusCommand(): Promise<void> {
-  const state = await readRuntimeState();
+function transportProcessLabel(provider: RuntimeState["transportProvider"]): string {
+  return provider === "openai" ? "tunnel-client" : "cloudflared";
+}
+
+export async function statusCommand(instanceName?: string): Promise<void> {
+  const state = await stateFor(instanceName);
   if (!state) {
-    console.log("CodeRelay is not running.");
+    console.log("CodeRelay instance is not running.");
     return;
   }
   const serverAlive = isProcessAlive(state.pid);
-  const tunnelAlive = !state.tunnelPid || isProcessAlive(state.tunnelPid);
-  const serverReachable = await health(`${localBaseUrl(state.host, state.port)}/health`);
-  const tunnelReachable = state.tunnelBaseUrl.startsWith("https://") ? await health(`${state.tunnelBaseUrl}/health`) : true;
-  const stateLabel = await refreshTransportState(state, tunnelAlive, tunnelReachable);
-  console.log(`CodeRelay ${serverAlive && serverReachable ? "running" : "not healthy"}`);
+  const localReachable = await health(`${localBaseUrl(state.host, state.port)}/health`);
+  let transportAlive = false;
+  let transportReachable = false;
+  if (state.transportPid && state.transportProvider !== "disabled") {
+    transportAlive = isProcessAlive(state.transportPid);
+    transportReachable = await providerFor(state.transportProvider).healthCheck(processFromState(state));
+  }
+  const stateLabel = await refreshTransportState(state, transportAlive, transportReachable);
+  console.log(`CodeRelay ${serverAlive && localReachable ? "running" : "not healthy"}`);
+  console.log(`Instance: ${state.instanceName}`);
   console.log(`Workspace: ${state.workspace}`);
-  console.log(`MCP endpoint: ${state.endpoint}`);
-  console.log(`Transport: ${state.tunnelPid ? "cloudflared" : "disabled"}`);
+  console.log(`Transport: ${state.transportProvider}`);
   console.log(`Transport state: ${stateLabel}`);
   console.log(`Local MCP process: ${serverAlive ? "healthy" : "unavailable"}`);
-  console.log(`Local MCP /health: ${serverReachable ? "healthy" : "unavailable"}`);
-  console.log(`cloudflared process: ${state.tunnelPid ? (tunnelAlive ? "healthy" : "unavailable") : "disabled"}`);
-  console.log(`Public tunnel /health: ${state.tunnelPid ? (tunnelReachable ? "healthy" : "unavailable") : "disabled"}`);
-  if (state.tunnelExecutable) console.log(`Transport runtime: ${state.tunnelExecutable}`);
+  console.log(`Local MCP /health: ${localReachable ? "healthy" : "unavailable"}`);
+  console.log(`${transportProcessLabel(state.transportProvider)} process: ${state.transportProvider === "disabled" ? "disabled" : transportAlive ? "healthy" : "unavailable"}`);
+  console.log(`${state.transportProvider === "openai" ? "OpenAI tunnel /readyz" : "Public tunnel /health"}: ${state.transportProvider === "disabled" ? "disabled" : transportReachable ? "healthy" : "unavailable"}`);
+  if (state.openaiTunnelId) console.log(`OpenAI tunnel ID: ${state.openaiTunnelId}`);
+  if (state.transportExecutable) console.log(`Transport runtime: ${state.transportExecutable}`);
   console.log(`Started: ${state.startedAt}`);
 }
 
-export async function doctorCommand(workspacePath = process.cwd()): Promise<void> {
-  const state = await readRuntimeState();
+function displayPath(workspace: string): string {
+  const home = process.env.HOME;
+  return home && workspace.startsWith(`${home}/`) ? `~/${workspace.slice(home.length + 1)}` : workspace;
+}
+
+export async function listCommand(): Promise<void> {
+  const records = await listInstanceRecords();
+  const states = await listRuntimeStates();
+  const byName = new Map(states.map((state) => [state.instanceName, state]));
+  const names = new Set([...records.map((record) => record.instanceName), ...states.map((state) => state.instanceName)]);
+  console.log("NAME\tWORKSPACE\tTRANSPORT\tSTATUS");
+  for (const name of [...names].sort()) {
+    const state = byName.get(name);
+    const record = records.find((item) => item.instanceName === name);
+    const transport = state?.transportProvider ?? record?.transport ?? "auto";
+    const status = state ? `${state.transportState ?? "starting"}` : "stopped";
+    console.log(`${name}\t${displayPath(state?.workspace ?? record?.workspace ?? "")}\t${transport}\t${status}`);
+  }
+}
+
+export async function doctorCommand(workspacePath = process.cwd(), instanceName?: string): Promise<void> {
+  const state = await stateFor(instanceName, workspacePath);
   const workspace = state?.workspace ?? path.resolve(workspacePath);
   const checks: Array<{ label: string; ok: boolean; detail?: string }> = [];
   let diagnosis: string | undefined;
@@ -342,26 +470,32 @@ export async function doctorCommand(workspacePath = process.cwd()): Promise<void
     const localHealthOk = await health(`${localBaseUrl(state.host, state.port)}/health`);
     checks.push({ label: "Local MCP process", ok: localProcessOk, detail: `Check ${state.serverLog}` });
     checks.push({ label: "Local MCP /health", ok: localHealthOk, detail: `Check ${state.serverLog}` });
-    const provider = new CloudflaredTunnelProvider();
-    let publicHealthOk = false;
-    const runtime = state.tunnelExecutable ? { path: state.tunnelExecutable } : await provider.runtime();
-    if (state.tunnelPid) {
-      const tunnelProcessOk = isProcessAlive(state.tunnelPid);
-      publicHealthOk = state.tunnelBaseUrl.startsWith("https://") && await provider.healthCheck(state.tunnelBaseUrl);
-      await refreshTransportState(state, tunnelProcessOk, publicHealthOk);
-      checks.push({ label: runtime ? `cloudflared runtime: ${runtime.path}` : "cloudflared runtime", ok: runtime !== null, detail: "CodeRelay will download a verified runtime on the next start." });
-      checks.push({ label: "cloudflared process", ok: tunnelProcessOk, detail: `Check ${state.tunnelLog || "tunnel status"}` });
-      checks.push({ label: "Public tunnel /health", ok: publicHealthOk, detail: `Check ${state.tunnelLog || "tunnel status"}` });
+    if (state.transportProvider === "disabled") {
+      checks.push({ label: "Transport process (disabled)", ok: true });
+      checks.push({ label: "Transport readiness (disabled)", ok: true });
     } else {
-      checks.push({ label: "cloudflared process (disabled)", ok: true });
-      checks.push({ label: "Public tunnel /health (disabled)", ok: true });
-    }
-
-    if (state.tunnelPid && localProcessOk && localHealthOk && !publicHealthOk) {
-      diagnosis = "Your local CodeRelay server is healthy.\nThe problem is between the Cloudflare edge and the local tunnel.";
+      const runtimeOk = state.transportProvider === "openai"
+        ? resolveTunnelClient() !== null
+        : (await new CloudflaredTunnelProvider().runtime()) !== null;
+      const provider = providerFor(state.transportProvider);
+      const transportProcessOk = isProcessAlive(state.transportPid);
+      const transportHealthy = state.transportPid > 0 && await provider.healthCheck(processFromState(state));
+      checks.push({
+        label: state.transportProvider === "openai" ? "tunnel-client runtime" : "cloudflared runtime",
+        ok: runtimeOk,
+        detail: state.transportProvider === "openai" ? "Install tunnel-client or set CODERELAY_TUNNEL_CLIENT." : "CodeRelay will download a verified runtime on the next start."
+      });
+      checks.push({ label: `${transportProcessLabel(state.transportProvider)} process`, ok: transportProcessOk, detail: `Check ${state.transportLog || "transport status"}` });
+      checks.push({ label: state.transportProvider === "openai" ? "OpenAI tunnel /readyz" : "Public tunnel /health", ok: transportHealthy, detail: `Check ${state.transportLog || "transport status"}` });
+      await refreshTransportState(state, transportProcessOk, transportHealthy);
+      if (localProcessOk && localHealthOk && !transportHealthy) {
+        diagnosis = state.transportProvider === "openai"
+          ? "Your local CodeRelay server is healthy.\nThe problem is between tunnel-client and the OpenAI control plane."
+          : "Your local CodeRelay server is healthy.\nThe problem is between the Cloudflare edge and the local tunnel.";
+      }
     }
   } else {
-    checks.push({ label: "CodeRelay runtime", ok: false, detail: "Run coderelay start first." });
+    checks.push({ label: "CodeRelay instance", ok: false, detail: "Run coderelay first." });
   }
 
   console.log("CodeRelay Doctor\n");
@@ -384,7 +518,10 @@ export async function configShowCommand(workspacePath = process.cwd()): Promise<
   console.log(JSON.stringify(config, null, 2));
 }
 
-export async function restartCommand(options: StartOptions = {}): Promise<void> {
-  await stopCommand();
-  await startCommand(options);
+export async function restartCommand(instanceName?: string, options: StartOptions = {}): Promise<void> {
+  const state = await stateFor(instanceName, options.workspace ?? process.cwd());
+  const record = instanceName ? (await listInstanceRecords()).find((item) => item.instanceName === instanceName) : undefined;
+  const workspace = options.workspace ?? state?.workspace ?? record?.workspace ?? process.cwd();
+  await stopCommand(instanceName, workspace);
+  await startCommand({ ...options, workspace, name: options.name ?? state?.instanceName ?? record?.instanceName ?? instanceName });
 }

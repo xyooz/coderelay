@@ -108,11 +108,14 @@ describe("CodeRelay first-run MCP flow", () => {
       expect(startExit.code).toBe(0);
       const endpoint = output.match(/http:\/\/127\.0\.0\.1:\d+\/mcp\/[^\s]+/u)?.[0];
       expect(endpoint).toBeTruthy();
-      await waitForPath(path.join(coderelayHome, "runtime.json"));
+      const instanceName = path.basename(workspace);
+      const runtimePath = path.join(coderelayHome, "instances", instanceName, "runtime.json");
+      await waitForPath(runtimePath);
 
       const status = launchCli(["status"], coderelayHome);
       const statusExit = await status.exit;
       expect(statusExit.code).toBe(0);
+      expect(statusExit.stdout).toContain("Instance:");
       expect(statusExit.stdout).toContain("Transport: disabled");
       expect(statusExit.stdout).toContain("Transport state: disabled");
       expect(statusExit.stdout).toContain("Local MCP process: healthy");
@@ -129,6 +132,8 @@ describe("CodeRelay first-run MCP flow", () => {
       expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
         "list_files", "read_file", "search_code", "write_file", "edit_file", "run_command", "git_diff"
       ]);
+      expect(listed.result.tools.find((tool: { name: string }) => tool.name === "read_file").description).toContain("Active CodeRelay instance");
+      expect(listed.result.tools.find((tool: { name: string }) => tool.name === "read_file").description).toContain(workspace);
 
       const read = await mcpCall(endpoint!, "tools/call", { name: "read_file", arguments: { path: "package.json" } }, 3);
       expect(toolText(read)).toContain("coderelay-e2e-fixture");
@@ -151,9 +156,45 @@ describe("CodeRelay first-run MCP flow", () => {
       const stop = launchCli(["stop"], coderelayHome);
       const stopExit = await stop.exit;
       expect(stopExit.code).toBe(0);
-      await expect(readFile(path.join(coderelayHome, "runtime.json"), "utf8")).rejects.toThrow();
+      await expect(readFile(runtimePath, "utf8")).rejects.toThrow();
     } finally {
       await rm(workspace, { recursive: true, force: true });
+      await rm(coderelayHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("runs two isolated instances with independent runtime state", async () => {
+    const firstWorkspace = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-first-"));
+    const secondWorkspace = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-second-"));
+    const coderelayHome = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-home-"));
+
+    try {
+      const first = launchCli([firstWorkspace, "--name", "project-a", "--no-tunnel"], coderelayHome);
+      expect((await first.waitForOutput("Instance: project-a")).includes(firstWorkspace)).toBe(true);
+      expect((await first.exit).code).toBe(0);
+
+      const second = launchCli([secondWorkspace, "--name", "project-b", "--no-tunnel"], coderelayHome);
+      expect((await second.waitForOutput("Instance: project-b")).includes(secondWorkspace)).toBe(true);
+      expect((await second.exit).code).toBe(0);
+
+      const list = launchCli(["list"], coderelayHome);
+      const listExit = await list.exit;
+      expect(listExit.code).toBe(0);
+      expect(listExit.stdout).toContain("project-a");
+      expect(listExit.stdout).toContain("project-b");
+      expect(listExit.stdout).toContain("project-a\t");
+      expect(listExit.stdout).toContain("project-b\t");
+
+      const stopFirst = launchCli(["stop", "project-a"], coderelayHome);
+      expect((await stopFirst.exit).code).toBe(0);
+      const statusSecond = launchCli(["status", "project-b"], coderelayHome);
+      expect((await statusSecond.exit).stdout).toContain("Instance: project-b");
+
+      const stopSecond = launchCli(["stop", "project-b"], coderelayHome);
+      expect((await stopSecond.exit).code).toBe(0);
+    } finally {
+      await rm(firstWorkspace, { recursive: true, force: true });
+      await rm(secondWorkspace, { recursive: true, force: true });
       await rm(coderelayHome, { recursive: true, force: true });
     }
   }, 60_000);

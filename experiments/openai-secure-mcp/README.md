@@ -1,6 +1,6 @@
 # OpenAI Secure MCP Tunnel PoC
 
-This experiment connects CodeRelay's existing local MCP server to ChatGPT through OpenAI's Secure MCP Tunnel. It intentionally does not change the default CodeRelay transport or add a new MCP tool.
+This experiment connects CodeRelay's existing local MCP server to ChatGPT through OpenAI's Secure MCP Tunnel. The production branch now also manages `tunnel-client` as a transport provider; this harness remains useful for isolating the official client and for reproducing control-plane issues.
 
 The flow is:
 
@@ -67,4 +67,4 @@ If the tunnel is not listed, check that the tunnel is associated with the target
 
 ## Scope boundary
 
-This is a PoC only. It does not add `--transport openai`, `src/tunnel/openai.ts`, automatic provider selection, or any new MCP tool. The stable Cloudflare Quick Tunnel path on `main` remains unchanged.
+The harness does not create OpenAI tunnels, API keys, or ChatGPT apps. It does not add MCP tools or implement the Secure MCP Tunnel protocol. CodeRelay starts the official `tunnel-client` and keeps the API key in the process environment only. The stable Cloudflare Quick Tunnel path remains available as the automatic fallback.

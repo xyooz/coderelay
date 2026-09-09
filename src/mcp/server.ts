@@ -5,6 +5,7 @@ import { createMcpServer } from "./tools.js";
 
 export interface ServeOptions {
   workspaceRoot: string;
+  instanceName: string;
   host: string;
   port: number;
   token: string;
@@ -40,14 +41,20 @@ function isAllowedOrigin(request: http.IncomingMessage): boolean {
 /** Start one loopback MCP endpoint protected by an unguessable URL path. */
 export async function startMcpServer(options: ServeOptions): Promise<RunningServer> {
   const endpointPath = `/mcp/${options.token}`;
-  const handler = createMcpHandler(() => createMcpServer({ workspaceRoot: options.workspaceRoot }));
+  const handler = createMcpHandler(() => createMcpServer({ workspaceRoot: options.workspaceRoot, instanceName: options.instanceName }));
   const nodeHandler = toNodeHandler(handler);
 
   const server = http.createServer((request, response) => {
     const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
 
     if (request.method === "GET" && requestUrl.pathname === "/health") {
-      writeJson(response, 200, { ok: true, name: "coderelay", version: "0.1.0" });
+      writeJson(response, 200, {
+        ok: true,
+        name: "coderelay",
+        version: "0.1.0",
+        instance: options.instanceName,
+        workspace: options.workspaceRoot
+      });
       return;
     }
 
@@ -106,5 +113,5 @@ export async function runMcpServer(options: ServeOptions): Promise<void> {
     console.error(error);
     void shutdown();
   });
-  console.error(`CodeRelay MCP server listening on http://${options.host}:${options.port}${running.endpointPath}`);
+  console.error(`CodeRelay MCP server (${options.instanceName}) listening on http://${options.host}:${options.port}${running.endpointPath}`);
 }
