@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { isSensitiveRelativePath } from "./sensitive-files.js";
 
@@ -92,5 +93,6 @@ export async function resolveWorkspacePath(
 }
 
 export function toWorkspaceRelativePath(workspaceRoot: string, absolutePath: string): string {
-  return path.relative(workspaceRoot, absolutePath).split(path.sep).join("/") || ".";
+  const canonicalRoot = fsSync.realpathSync.native(workspaceRoot);
+  return path.relative(canonicalRoot, absolutePath).split(path.sep).join("/") || ".";
 }

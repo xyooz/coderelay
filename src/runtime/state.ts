@@ -18,6 +18,7 @@ export interface RuntimeState {
   port: number;
   token: string;
   tunnelProvider: "cloudflared";
+  tunnelExecutable?: string;
   tunnelBaseUrl: string;
   endpoint: string;
   startedAt: string;
@@ -25,7 +26,9 @@ export interface RuntimeState {
   tunnelLog: string;
 }
 
-export const CODERELAY_HOME = path.join(os.homedir(), ".coderelay");
+export const CODERELAY_HOME = process.env.CODERELAY_HOME
+  ? path.resolve(process.env.CODERELAY_HOME)
+  : path.join(os.homedir(), ".coderelay");
 export const RUNTIME_PATH = path.join(CODERELAY_HOME, "runtime.json");
 export const LOG_PATH = path.join(CODERELAY_HOME, "logs");
 

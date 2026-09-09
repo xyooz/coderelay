@@ -2,6 +2,9 @@ export interface TunnelProcess {
   pid: number;
   baseUrl: string;
   logPath: string;
+  executablePath: string;
+  executableSource: "path" | "cache" | "download";
+  executableVersion: string;
 }
 
 export interface TunnelProvider {

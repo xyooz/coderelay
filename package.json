@@ -19,8 +19,10 @@
     "build": "tsup",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "test": "vitest run --exclude tests/e2e/**",
+    "test:e2e": "npm run build && vitest run tests/e2e",
+    "typecheck": "tsc --noEmit",
+    "pack:check": "npm run build && node scripts/check-package.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",

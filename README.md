@@ -25,9 +25,9 @@ CodeRelay gives ChatGPT a small, safe toolset for your current repository:
 
 - Node.js 22 or newer
 - Git
-- [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) on `PATH` for the public MCP endpoint
+- Internet access on first start so CodeRelay can download its tunnel runtime
 
-CodeRelay uses a Cloudflare Quick Tunnel. It does not require a Cloudflare account or API key. The tunnel URL is temporary and changes when CodeRelay restarts.
+CodeRelay uses a Cloudflare Quick Tunnel. It does not require a Cloudflare account, API key, `sudo`, or a package manager. If `cloudflared` is already on `PATH`, CodeRelay uses it; otherwise it downloads a verified platform binary into `~/.coderelay/bin/` and reuses it on later starts. The tunnel URL is temporary and changes when CodeRelay restarts.
 
 ## Commands
 
@@ -74,9 +74,34 @@ Runtime state and logs live outside the repository:
 ```text
 ~/.coderelay/runtime.json
 ~/.coderelay/logs/
+~/.coderelay/bin/cloudflared
 ```
 
 The workspace `.coderelay/` directory is ignored by Git.
+
+## How it works
+
+```text
+ChatGPT
+   │
+   │ MCP
+   ▼
+CodeRelay
+   │
+   ├── Read / Edit
+   ├── Search
+   ├── Test / Build
+   └── Git Diff
+   │
+   ▼
+Your Repository
+```
+
+```text
+Local server:     127.0.0.1
+Public access:    temporary Cloudflare Quick Tunnel
+Workspace access: current repository only
+```
 
 ## Development
 
@@ -85,6 +110,8 @@ npm install
 npm run typecheck
 npm test
 npm run build
+npm run test:e2e
+npm run pack:check
 ```
 
 The MCP server is built with the official MCP TypeScript SDK and served over Streamable HTTP. The first release intentionally avoids GUI, multi-agent routing, memory, indexing, and cloud account features.

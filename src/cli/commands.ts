@@ -121,6 +121,7 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
   const serverPid = serverProcess.pid;
   if (!serverPid) throw new Error("Could not start the local MCP server.");
   let tunnelPid = 0;
+  let tunnelExecutable = "";
 
   try {
     const localHealthUrl = `${localBaseUrl(host, port)}/health`;
@@ -133,15 +134,14 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
 
     if (useTunnel) {
       const provider = new CloudflaredTunnelProvider();
-      if (!(await provider.isAvailable())) {
-        throw new Error("cloudflared is required for a public MCP endpoint. Install it or run coderelay start --no-tunnel for local checks.");
-      }
       const tunnel = await provider.start(port);
       tunnelPid = tunnel.pid;
+      tunnelExecutable = tunnel.executablePath;
       tunnelBaseUrl = tunnel.baseUrl;
       tunnelLog = tunnel.logPath;
       await waitForTunnel(provider, tunnelBaseUrl);
       endpoint = endpointFor(tunnelBaseUrl, token);
+      console.log(`  ✓ Tunnel runtime: ${tunnelExecutable} (${tunnel.executableSource})`);
       console.log("  ✓ Secure connection established");
     } else {
       console.log("  ! Tunnel disabled; endpoint is local-only");
@@ -155,6 +155,7 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
       port,
       token,
       tunnelProvider: "cloudflared",
+      tunnelExecutable: tunnelExecutable || undefined,
       tunnelBaseUrl,
       endpoint,
       startedAt: new Date().toISOString(),
@@ -164,11 +165,14 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
     await writeRuntimeState(state);
 
     console.log(`  ✓ Workspace config: ${configPath}`);
-    console.log("\nMCP Endpoint:");
+    console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log("Your CodeRelay endpoint is ready:");
     console.log(endpoint);
-    console.log("\nNext:");
-    console.log("1. Add the endpoint to ChatGPT as an MCP server");
-    console.log('2. Try: "Analyze this project and tell me how it is structured."');
+    console.log("\nChatGPT:");
+    console.log("Settings → Plugins → + → Custom MCP");
+    console.log("Paste the endpoint above.");
+    console.log('\nThen ask: "Inspect this repository and run its tests."');
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     console.log("\nRun coderelay doctor if anything looks wrong.");
   } catch (error) {
     await terminateProcess(tunnelPid);
@@ -221,6 +225,7 @@ export async function statusCommand(): Promise<void> {
   console.log(`CodeRelay ${serverAlive && serverReachable ? "running" : "not healthy"}`);
   console.log(`Workspace: ${state.workspace}`);
   console.log(`MCP endpoint: ${state.endpoint}`);
+  if (state.tunnelExecutable) console.log(`Tunnel runtime: ${state.tunnelExecutable}`);
   console.log(`Server: ${serverAlive && serverReachable ? "healthy" : "unavailable"}`);
   console.log(`Tunnel: ${tunnelAlive && tunnelReachable ? "healthy" : "unavailable"}`);
   console.log(`Started: ${state.startedAt}`);
@@ -244,8 +249,14 @@ export async function doctorCommand(workspacePath = process.cwd()): Promise<void
   if (state) {
     checks.push({ label: "MCP server reachable", ok: await health(`${localBaseUrl(state.host, state.port)}/health`), detail: `Check ${state.serverLog}` });
     const provider = new CloudflaredTunnelProvider();
-    checks.push({ label: "Tunnel binary available", ok: await provider.isAvailable(), detail: "Install cloudflared or use --no-tunnel for local checks." });
-    checks.push({ label: "HTTPS endpoint reachable", ok: state.tunnelBaseUrl.startsWith("https://") && await provider.healthCheck(state.tunnelBaseUrl), detail: `Check ${state.tunnelLog || "tunnel status"}` });
+    const runtime = state.tunnelExecutable ? { path: state.tunnelExecutable } : await provider.runtime();
+    if (state.tunnelPid) {
+      checks.push({ label: runtime ? `Tunnel runtime: ${runtime.path}` : "Tunnel runtime", ok: runtime !== null, detail: "CodeRelay will download a verified runtime on the next start." });
+      checks.push({ label: "HTTPS endpoint reachable", ok: state.tunnelBaseUrl.startsWith("https://") && await provider.healthCheck(state.tunnelBaseUrl), detail: `Check ${state.tunnelLog || "tunnel status"}` });
+    } else {
+      checks.push({ label: "Tunnel runtime (disabled)", ok: true });
+      checks.push({ label: "Public tunnel (disabled)", ok: true });
+    }
   } else {
     checks.push({ label: "CodeRelay runtime", ok: false, detail: "Run coderelay start first." });
   }
