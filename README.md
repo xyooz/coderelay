@@ -2,7 +2,7 @@
 
 **Turn ChatGPT into a local coding agent in 30 seconds.**
 
-CodeRelay runs one local daemon, one secure tunnel, and serves multiple registered workspaces. Each ChatGPT MCP session selects its own workspace, so two chats can work on two projects without sharing a global “current project”.
+CodeRelay runs one local daemon, one secure tunnel, and serves multiple registered workspaces. Each ChatGPT chat can keep a separate logical task context, so two chats can work on two projects without sharing a global “current project”.
 
 ```bash
 npx coderelay
@@ -31,7 +31,7 @@ Start the single daemon:
 coderelay
 ```
 
-Connect the one CodeRelay MCP app in ChatGPT. Treat one ChatGPT chat as one project context: ask CodeRelay to call `list_workspaces`, then `use_workspace` with the project name. CodeRelay returns the workspace identity and instructions for the conversation. For clients that recreate MCP sessions, workspace-scoped tools also accept the registered workspace name explicitly; explicit workspace takes precedence over the transport session cache.
+Connect the one CodeRelay MCP app in ChatGPT. Treat one ChatGPT chat as one logical task context: ask CodeRelay to call `list_workspaces`, then `use_workspace` with the project name. CodeRelay returns the workspace identity and instructions for the task. For clients that recreate MCP sessions, workspace-scoped tools also accept the registered workspace name explicitly; explicit workspace takes precedence over the transport session cache.
 
 The common tools are:
 
@@ -40,7 +40,7 @@ The common tools are:
 - `run_command`
 - `git_diff`
 
-Before using a file or command tool, either pass `workspace: "project-name"` or call `use_workspace` first. `workspace` accepts only a registry name or id, never an arbitrary path. Keep using the same workspace in a chat and start a new chat for another project when possible.
+Before using a file or command tool, either pass `workspace: "project-name"` or call `use_workspace` first. `workspace` accepts only a registry name or id, never an arbitrary path. `use_workspace` sets the default for the logical task context; when the user explicitly asks to work in another registered project, pass that workspace on the relevant call.
 
 For example:
 
@@ -61,7 +61,7 @@ coderelay setup
 CodeRelay supports four transports:
 
 - `openai` — OpenAI Secure MCP Tunnel, preferred when configured
-- `cloudflare-named` — an existing Cloudflare tunnel that you own
+- `cloudflare-named` — a remotely-managed Cloudflare tunnel connector (local-management remains supported for advanced setups)
 - `cloudflare-quick` — zero-configuration fallback
 - `local` — loopback only, equivalent to local testing
 
@@ -95,7 +95,7 @@ The OpenAI tunnel ID uses CLI `--tunnel-id` first, then saved config, then `CONT
 
 OpenAI transport uses the official `tunnel-client`. When automatic selection cannot use it, CodeRelay explicitly reports the reason and falls back to `cloudflare-quick`. No Cloudflare account or API key is required for a Quick Tunnel. An existing `cloudflared` on `PATH` is preferred; otherwise CodeRelay downloads a pinned official binary and verifies its SHA256 before execution.
 
-For a Cloudflare Named Tunnel, authenticate and create the tunnel with Cloudflare's local-management workflow, then select `cloudflare-named` and provide its name/ID plus hostname. CodeRelay only runs the existing tunnel; it does not create, delete, or manage Cloudflare account resources.
+For a Cloudflare Named Tunnel, the setup flow uses a remotely-managed tunnel: create a Tunnel in the [Cloudflare dashboard](https://dash.cloudflare.com/), add a Published Application with service `http://127.0.0.1:7676`, choose “Install and run a connector”, and paste the connector command or token into CodeRelay. The token is kept in `~/.coderelay/credentials.json` with mode `0600`; the hostname and management mode are stored separately in `~/.coderelay/config.json`. Locally-managed tunnels remain supported by setting `cloudflare.management` to `local` and providing the existing local config and credentials.
 
 Inspect the saved non-secret settings with:
 

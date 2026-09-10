@@ -2,20 +2,25 @@ import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
   readDaemonConfig,
+  readCloudflareTunnelTokenSync,
   readOpenAiApiKeySync,
   resolveTransportConfig,
   writeDaemonConfig,
+  writeCloudflareTunnelToken,
   writeOpenAiApiKey,
+  CREDENTIALS_PATH,
   type DaemonConfig,
   type TransportPreference
 } from "../runtime/state.js";
 import { resolveTunnelClient } from "../tunnel/openai.js";
 import { resolveInstalledCloudflared } from "../tunnel/download.js";
-import { listCloudflareTunnels } from "../tunnel/cloudflare-named.js";
+import { parseCloudflareTunnelToken } from "../tunnel/cloudflare-named.js";
 
 export const OPENAI_TUNNEL_DOCS = "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels";
 export const OPENAI_TUNNEL_SETTINGS = "https://platform.openai.com/settings/organization/tunnels";
 export const OPENAI_API_KEYS = "https://platform.openai.com/api-keys";
+export const CLOUDFLARE_TUNNEL_DASHBOARD = "https://dash.cloudflare.com/";
+export const CLOUDFLARE_REMOTE_TUNNEL_DOCS = "https://developers.cloudflare.com/tunnel/advanced/tunnel-tokens/";
 export const CLOUDFLARE_TUNNEL_DOCS = "https://developers.cloudflare.com/tunnel/advanced/local-management/create-local-tunnel/";
 
 export function isInteractiveTerminal(): boolean {
@@ -98,23 +103,31 @@ async function askSecret(question: string, reader?: ReturnType<typeof createInte
   });
 }
 
-async function saveOpenAiSetup(reader: ReturnType<typeof createInterface>, config: DaemonConfig): Promise<DaemonConfig> {
+export async function saveOpenAiSetup(
+  reader: ReturnType<typeof createInterface>,
+  config: DaemonConfig,
+  credentialsPath = CREDENTIALS_PATH
+): Promise<DaemonConfig> {
   const currentId = config.openai?.tunnelId;
   const tunnelId = await ask(reader, "OpenAI tunnel ID", currentId ?? process.env.CONTROL_PLANE_TUNNEL_ID);
   if (!/^tunnel_[0-9a-f]{32}$/u.test(tunnelId)) {
     throw new Error("Tunnel ID must look like tunnel_ followed by 32 hexadecimal characters.");
   }
 
-  const apiKey = readOpenAiApiKeySync();
+  const apiKey = readOpenAiApiKeySync(undefined, credentialsPath);
   if (apiKey.source === "missing") {
     console.log(`Create a key with Tunnels Read + Use at ${OPENAI_API_KEYS}`);
     const entered = await askSecret("OpenAI API key (leave blank to configure it later)", reader);
     if (entered) {
       const shouldSave = (await ask(reader, "Save this key in ~/.coderelay/credentials.json?", "Y")).toLowerCase();
-      if (shouldSave !== "n" && shouldSave !== "no") await writeOpenAiApiKey(entered);
+      if (shouldSave !== "n" && shouldSave !== "no") await writeOpenAiApiKey(entered, credentialsPath);
     }
+  } else if (apiKey.source === "environment") {
+    console.log("API key detected from CONTROL_PLANE_API_KEY.");
+    const shouldSave = (await ask(reader, "Save this key locally for future use?", "Y")).toLowerCase();
+    if (shouldSave !== "n" && shouldSave !== "no") await writeOpenAiApiKey(apiKey.value ?? "", credentialsPath);
   } else {
-    console.log(`API key: configured (${apiKey.source === "environment" ? "CONTROL_PLANE_API_KEY" : "local credentials file"})`);
+    console.log("API key: configured (local credentials file)");
   }
 
   return {
@@ -125,21 +138,30 @@ async function saveOpenAiSetup(reader: ReturnType<typeof createInterface>, confi
 }
 
 async function saveNamedSetup(reader: ReturnType<typeof createInterface>, config: DaemonConfig): Promise<DaemonConfig> {
-  const tunnel = await ask(reader, "Cloudflare tunnel name or ID", config.cloudflare?.tunnel);
+  console.log(`Cloudflare dashboard: ${CLOUDFLARE_TUNNEL_DASHBOARD}`);
+  console.log(`Token instructions: ${CLOUDFLARE_REMOTE_TUNNEL_DOCS}`);
+  console.log("In the dashboard: create a Tunnel → add a Published Application → set the hostname and service.");
+  console.log("Use service http://127.0.0.1:7676, leave Path blank, then choose Install and run a connector.");
+  const existingToken = readCloudflareTunnelTokenSync();
+  const entered = await askSecret("Paste the connector command or tunnel token (leave blank to keep the saved token)", reader);
+  const token = entered ? parseCloudflareTunnelToken(entered) : existingToken.value;
+  if (!token) {
+    throw new Error(`A valid Cloudflare tunnel token is required. See ${CLOUDFLARE_REMOTE_TUNNEL_DOCS}`);
+  }
   const hostname = await ask(reader, "Public hostname", config.cloudflare?.hostname);
-  if (!tunnel || !hostname || !/^[a-zA-Z0-9.-]+$/u.test(hostname)) {
-    throw new Error("Cloudflare Named Tunnel requires a tunnel name/ID and a valid hostname.");
+  if (!hostname || !/^[a-zA-Z0-9.-]+$/u.test(hostname)) {
+    throw new Error("Cloudflare Named Tunnel requires a valid public hostname.");
   }
   const cloudflared = await resolveInstalledCloudflared();
   if (!cloudflared) {
-    console.log(`! cloudflared is not installed on PATH. See ${CLOUDFLARE_TUNNEL_DOCS}`);
+    console.log(`! cloudflared is not installed on PATH. Install and run the connector, or see ${CLOUDFLARE_REMOTE_TUNNEL_DOCS}`);
   } else {
-    const tunnels = listCloudflareTunnels(cloudflared.path);
-    if (tunnels.length > 0) console.log(`Found existing Cloudflare tunnel entries: ${tunnels.slice(0, 5).join(", ")}`);
+    console.log(`cloudflared: ${cloudflared.version}`);
   }
+  await writeCloudflareTunnelToken(token);
   return {
     ...mergeTransport(config, "cloudflare-named"),
-    cloudflare: { ...(config.cloudflare ?? {}), tunnel, hostname }
+    cloudflare: { management: "remote", hostname }
   };
 }
 

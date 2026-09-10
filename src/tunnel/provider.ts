@@ -6,6 +6,8 @@ export interface TunnelStartContext {
   workspace: string;
   instanceName: string;
   openaiTunnelId?: string;
+  cloudflareManagement?: "remote" | "local";
+  cloudflareTunnelToken?: string;
   cloudflareTunnel?: string;
   cloudflareHostname?: string;
   cloudflareConfigPath?: string;

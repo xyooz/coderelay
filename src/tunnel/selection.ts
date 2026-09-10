@@ -17,7 +17,7 @@ export async function selectTransport(
   const named = new CloudflareNamedTunnelProvider();
   if (preference === "cloudflare-named") {
     if (!await named.isAvailable(context)) {
-      throw new Error("Cloudflare Named Tunnel is not configured. Provide a local cloudflared tunnel config and credentials, then retry.");
+      throw new Error("Cloudflare Named Tunnel is not configured. Provide a remotely-managed tunnel token and hostname, or configure a locally-managed tunnel, then retry.");
     }
     return named;
   }

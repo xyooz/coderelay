@@ -11,6 +11,22 @@ import type { TunnelProcess, TunnelProvider, TunnelStartContext } from "./provid
 type LogDirectoryResolver = (instanceName: string) => string;
 
 export const CLOUDFLARE_TUNNEL_DOCS = "https://developers.cloudflare.com/tunnel/advanced/local-management/create-local-tunnel/";
+export const CLOUDFLARE_TUNNEL_DASHBOARD = "https://dash.cloudflare.com/";
+export const CLOUDFLARE_REMOTE_TUNNEL_DOCS = "https://developers.cloudflare.com/tunnel/advanced/tunnel-tokens/";
+
+/**
+ * Accept either the opaque token copied from the Cloudflare dashboard or the
+ * connector command shown by the dashboard. The input is never logged.
+ */
+export function parseCloudflareTunnelToken(input: string): string | null {
+  const value = input.trim();
+  if (!value) return null;
+
+  const commandMatch = value.match(/(?:^|\s)(?:--token|--token=|TUNNEL_TOKEN=)(?:\s+|=)?(?:"([^"]+)"|'([^']+)'|([^\s]+))/u);
+  const token = commandMatch?.[1] ?? commandMatch?.[2] ?? commandMatch?.[3] ?? value;
+  if (!token || /\s/u.test(token) || token.startsWith("--")) return null;
+  return token;
+}
 
 export function listCloudflareTunnels(executablePath: string): string[] {
   const result = spawnSync(executablePath, ["tunnel", "list"], { encoding: "utf8", windowsHide: true });
@@ -80,7 +96,10 @@ async function ensureNamedConfig(context: TunnelStartContext, tunnel: string): P
 }
 
 export function cloudflareNamedConfiguration(context?: TunnelStartContext): boolean {
-  if (!context?.cloudflareTunnel || !context.cloudflareHostname) return false;
+  if (!context?.cloudflareHostname || !/^[a-zA-Z0-9.-]+$/u.test(context.cloudflareHostname)) return false;
+  const management = context.cloudflareManagement ?? (context.cloudflareTunnelToken ? "remote" : "local");
+  if (management === "remote") return Boolean(context.cloudflareTunnelToken);
+  if (!context.cloudflareTunnel) return false;
   return Boolean(resolveCloudflareConfigPath(context.cloudflareConfigPath) || resolveCredentialsFile(context.cloudflareTunnel, context.cloudflareCredentialsFile));
 }
 
@@ -100,20 +119,43 @@ export class CloudflareNamedTunnelProvider implements TunnelProvider {
   async start(context: TunnelStartContext): Promise<TunnelProcess> {
     const tunnel = context.cloudflareTunnel?.trim();
     const hostname = context.cloudflareHostname?.trim();
-    if (!tunnel) throw new Error(`Cloudflare Named Tunnel requires a tunnel name or ID. Create one locally: ${CLOUDFLARE_TUNNEL_DOCS}`);
     if (!hostname || !/^[a-zA-Z0-9.-]+$/u.test(hostname)) throw new Error("Cloudflare Named Tunnel requires a valid hostname.");
+    const management = context.cloudflareManagement ?? (context.cloudflareTunnelToken ? "remote" : "local");
+    if (management === "remote" && !context.cloudflareTunnelToken) {
+      throw new Error(`Cloudflare remotely-managed Named Tunnel requires a tunnel token. Configure it with coderelay setup: ${CLOUDFLARE_REMOTE_TUNNEL_DOCS}`);
+    }
+    if (management === "local" && !tunnel) {
+      throw new Error(`Cloudflare locally-managed Named Tunnel requires a tunnel name or ID. Create one locally: ${CLOUDFLARE_TUNNEL_DOCS}`);
+    }
 
     const executable = await this.runtime();
-    if (!executable) throw new Error(`cloudflared was not found on PATH. Install it and authenticate a named tunnel: ${CLOUDFLARE_TUNNEL_DOCS}`);
-    const configPath = await ensureNamedConfig(context, tunnel);
+    if (!executable) {
+      const docs = management === "remote" ? CLOUDFLARE_REMOTE_TUNNEL_DOCS : CLOUDFLARE_TUNNEL_DOCS;
+      throw new Error(`cloudflared was not found on PATH. Install it and retry: ${docs}`);
+    }
+    let args: string[];
+    let environment = process.env;
+    if (management === "remote") {
+      // Cloudflare accepts TUNNEL_TOKEN for remotely-managed connectors. Keep
+      // the secret out of argv, RuntimeState, status, and CodeRelay logs.
+      const token = context.cloudflareTunnelToken;
+      if (!token) throw new Error(`Cloudflare remotely-managed Named Tunnel requires a tunnel token. Configure it with coderelay setup: ${CLOUDFLARE_REMOTE_TUNNEL_DOCS}`);
+      args = ["tunnel", "--no-autoupdate", "run"];
+      environment = { ...process.env, TUNNEL_TOKEN: token };
+    } else {
+      const localTunnel = tunnel;
+      if (!localTunnel) throw new Error(`Cloudflare locally-managed Named Tunnel requires a tunnel name or ID. Create one locally: ${CLOUDFLARE_TUNNEL_DOCS}`);
+      const configPath = await ensureNamedConfig(context, localTunnel);
+      args = ["tunnel", "--config", configPath, "--no-autoupdate", "run", localTunnel];
+    }
     const logDirectory = this.logDirectoryResolver(context.instanceName);
     await fs.mkdir(logDirectory, { recursive: true, mode: 0o700 });
     const logPath = path.join(logDirectory, `cloudflared-named-${Date.now()}.log`);
     const logFd = fsSync.openSync(logPath, "a");
-    const child = spawn(executable.path, ["tunnel", "--config", configPath, "--no-autoupdate", "run", tunnel], {
+    const child = spawn(executable.path, args, {
       detached: true,
       stdio: ["ignore", logFd, logFd],
-      env: process.env
+      env: environment
     });
     fsSync.closeSync(logFd);
     child.unref();

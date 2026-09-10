@@ -28,6 +28,7 @@ export interface OpenAiConfig {
 }
 
 export interface CloudflareConfig {
+  management?: "remote" | "local";
   tunnel?: string;
   hostname?: string;
   configPath?: string;
@@ -38,6 +39,9 @@ export interface CredentialsFile {
   openai?: {
     apiKey?: string;
   };
+  cloudflare?: {
+    tunnelToken?: string;
+  };
 }
 
 export type ApiKeySource = "environment" | "credentials" | "missing";
@@ -45,6 +49,13 @@ export type ApiKeySource = "environment" | "credentials" | "missing";
 export interface ApiKeyResolution {
   value?: string;
   source: ApiKeySource;
+}
+
+export type CloudflareTokenSource = "environment" | "credentials" | "missing";
+
+export interface CloudflareTokenResolution {
+  value?: string;
+  source: CloudflareTokenSource;
 }
 
 export interface RuntimeState {
@@ -63,6 +74,8 @@ export interface RuntimeState {
   transportBaseUrl?: string;
   transportHealthUrl?: string;
   openaiTunnelId?: string;
+  publicBaseUrl?: string;
+  mcpEndpoint?: string;
   endpoint: string;
   startedAt: string;
   serverLog: string;
@@ -183,10 +196,21 @@ export function normalizeDaemonConfig(raw: DaemonConfig): DaemonConfig {
   const fallback = typeof rawTransport === "object" && rawTransport !== null && rawTransport.fallback !== undefined
     ? normalizeTransport(rawTransport.fallback)
     : preferred === "openai" || preferred === "cloudflare-named" ? "cloudflare-quick" : undefined;
+  const cloudflare = raw.cloudflare
+    ? {
+        ...raw.cloudflare,
+        ...(raw.cloudflare.management
+          ? {}
+          : raw.cloudflare.tunnel || raw.cloudflare.configPath || raw.cloudflare.credentialsFile
+            ? { management: "local" as const }
+            : {})
+      }
+    : undefined;
   return {
     ...raw,
     transport: { preferred, ...(fallback ? { fallback } : {}) },
-    openai: raw.openai ?? (raw.openaiTunnelId ? { tunnelId: raw.openaiTunnelId } : undefined)
+    openai: raw.openai ?? (raw.openaiTunnelId ? { tunnelId: raw.openaiTunnelId } : undefined),
+    cloudflare
   };
 }
 
@@ -203,6 +227,20 @@ export function resolveTransportConfig(config: DaemonConfig | null): TransportCo
 
 export function resolveConfiguredOpenAiTunnelId(config: Pick<DaemonConfig, "openai" | "openaiTunnelId"> | null): string | undefined {
   return config?.openai?.tunnelId ?? config?.openaiTunnelId;
+}
+
+export function readCloudflareTunnelTokenSync(
+  environmentValue = process.env.CLOUDFLARE_TUNNEL_TOKEN || process.env.TUNNEL_TOKEN,
+  credentialsPath = CREDENTIALS_PATH
+): CloudflareTokenResolution {
+  if (environmentValue) return { value: environmentValue, source: "environment" };
+  try {
+    const parsed = JSON.parse(fsSync.readFileSync(credentialsPath, "utf8")) as CredentialsFile;
+    if (parsed.cloudflare?.tunnelToken) return { value: parsed.cloudflare.tunnelToken, source: "credentials" };
+  } catch {
+    // A missing or malformed credentials file is equivalent to missing auth.
+  }
+  return { source: "missing" };
 }
 
 export function readOpenAiApiKeySync(environmentValue = process.env.CONTROL_PLANE_API_KEY, credentialsPath = CREDENTIALS_PATH): ApiKeyResolution {
@@ -231,6 +269,11 @@ export async function writeCredentials(credentials: CredentialsFile, credentials
 export async function writeOpenAiApiKey(apiKey: string, credentialsPath = CREDENTIALS_PATH): Promise<void> {
   const current = await readCredentials(credentialsPath);
   await writeCredentials({ ...current, openai: { ...(current?.openai ?? {}), apiKey } }, credentialsPath);
+}
+
+export async function writeCloudflareTunnelToken(token: string, credentialsPath = CREDENTIALS_PATH): Promise<void> {
+  const current = await readCredentials(credentialsPath);
+  await writeCredentials({ ...current, cloudflare: { ...(current?.cloudflare ?? {}), tunnelToken: token } }, credentialsPath);
 }
 
 export async function removeOpenAiApiKey(credentialsPath = CREDENTIALS_PATH): Promise<void> {
@@ -357,6 +400,8 @@ function normalizeRuntimeState(raw: Partial<RuntimeState> & { tunnelPid?: number
     transportBaseUrl: raw.transportBaseUrl ?? raw.tunnelBaseUrl,
     transportHealthUrl: raw.transportHealthUrl,
     openaiTunnelId: raw.openaiTunnelId,
+    publicBaseUrl: raw.publicBaseUrl,
+    mcpEndpoint: raw.mcpEndpoint ?? raw.endpoint ?? "",
     endpoint: raw.endpoint ?? "",
     startedAt: raw.startedAt ?? new Date(0).toISOString(),
     serverLog: raw.serverLog ?? "",
