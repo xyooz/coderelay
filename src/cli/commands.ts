@@ -113,6 +113,11 @@ function providerFor(name: TransportProviderName): TunnelProvider {
   return new CloudflaredTunnelProvider(() => DAEMON_LOG_PATH);
 }
 
+function providerNameForPreference(preference: TransportPreference): RuntimeState["transportProvider"] {
+  if (preference === "openai" || preference === "cloudflare-named" || preference === "cloudflare-quick") return preference;
+  return "disabled";
+}
+
 function processFromState(state: RuntimeState): TunnelProcess {
   return {
     provider: state.transportProvider === "disabled" ? "local" : state.transportProvider,
@@ -294,6 +299,7 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           fallbackReason = reason;
+          state.transportProvider = providerNameForPreference(candidatePreference);
           console.log(`  ! ${candidatePreference} transport unavailable: ${reason}`);
           if (candidateIndex < candidatePreferences.length - 1) {
             console.log(`  ! Falling back to ${candidatePreferences[candidateIndex + 1]}.`);
@@ -440,6 +446,10 @@ export async function statusCommand(): Promise<void> {
     if (transportConfig.preferred === "openai") {
       console.log(`OpenAI API key: ${apiKey.source === "missing" ? "missing" : "configured"} (${apiKey.source})`);
       console.log(`OpenAI tunnel ID: ${resolveOpenAiTunnelId(undefined, config) ?? "not configured"}`);
+      console.log(`tunnel-client process: ${resolveTunnelClient() ? "available; daemon stopped" : "unavailable"}`);
+    } else if (transportConfig.preferred === "cloudflare-named" || transportConfig.preferred === "cloudflare-quick") {
+      const cloudflared = await new CloudflaredTunnelProvider(() => DAEMON_LOG_PATH).runtime();
+      console.log(`cloudflared process: ${cloudflared ? "available; daemon stopped" : "unavailable"}`);
     }
     return;
   }
