@@ -47,8 +47,54 @@ For example:
 ```text
 use_workspace({ name: "attendance" })
 read_file({ workspace: "attendance", path: "README.md" })
-run_command({ workspace: "attendance", command: "npm test" })
+run_command({ workspace: "attendance", command: { program: "npm", args: ["test"] } })
 ```
+
+## Agent Command Runtime
+
+`run_command` accepts a structured command, or a sequential list of structured commands:
+
+```json
+{
+  "commands": [
+    { "program": "npm", "args": ["run", "typecheck"] },
+    { "program": "npm", "args": ["test"] }
+  ],
+  "stop_on_error": true,
+  "timeout_ms": 120000
+}
+```
+
+Legacy string commands remain supported for compatibility, but shell operators are rejected. Every command runs with `shell: false`, inside the selected workspace, with bounded output and an explicit timeout. The result includes exit code, signal, duration, timeout, truncation, stdout, stderr, risk, policy, and approval state.
+
+The command policy defaults to `safe`. Higher-risk commands return `approval_required` instead of running immediately. Approve or deny the request from the local terminal:
+
+```bash
+coderelay approve <request_id> --once
+coderelay approve <request_id> --workspace
+coderelay deny <request_id>
+```
+
+The available modes are:
+
+```bash
+coderelay config policy safe
+coderelay config policy workspace
+coderelay config policy unrestricted
+coderelay trust <workspace-name>
+coderelay untrust <workspace-name>
+coderelay trust status
+coderelay policy list
+coderelay policy remove <rule-id>
+```
+
+Workspace approvals are exact-match rules: the workspace, program, argument count, and every argument must match. `coderelay policy list` labels the stored arguments as `ARGS (EXACT MATCH)`; approving `git push origin main` does not approve `git push origin main --force`.
+
+`workspace` mode allows inspection by default and requires a trusted workspace for workspace writes or execution. Network, external writes, destructive, and privileged operations still require approval. `unrestricted` removes those approval prompts except for hard-denied commands such as deleting the filesystem root. The policy store and pending approvals are kept under `~/.coderelay/policies/` with restrictive permissions; the audit log is `~/.coderelay/audit.log` and does not include command output, environment variables, or inline credentials.
+
+Command policy is authoritative on the user side (`~/.coderelay/config.json` and the policy store). A project-controlled `.coderelay/config.json` cannot widen the daemon policy; any future project-level policy must only make it stricter.
+
+The workspace policy is a boundary for CodeRelay decisions, not an OS sandbox. Even trusted workspace execution can access files outside the workspace or the network through scripts and tools. True filesystem and network isolation requires a later OS-level sandbox implementation.
 
 ## Secure transport
 
@@ -167,7 +213,7 @@ At session binding time, CodeRelay discovers root-level `AGENTS.md` and `AGENTS.
 
 CodeRelay binds the MCP server to `127.0.0.1`, protects the endpoint with a random path token, and rejects browser origins that do not match the request host.
 
-Every file path is canonicalized and checked against the selected workspace. Symlink escapes, `..` traversal, and sensitive files are blocked. Commands run with `shell: false`; pipes, redirects, chaining, privilege escalation, destructive Git operations, and recursive deletion are rejected.
+Every file path is canonicalized and checked against the selected workspace. Symlink escapes, `..` traversal, and sensitive files are blocked. Commands run with `shell: false`; pipes, redirects, and chaining are rejected. Risky operations go through the configured policy and local approval flow, while hard-denied commands remain blocked in every mode.
 
 The endpoint is a local developer tool, not a replacement for reviewing proposed edits or commands.
 

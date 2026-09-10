@@ -6,7 +6,8 @@ import { WorkspaceSessionManager } from "./session.js";
 import { inspectMcpRequest, mcpTraceEnabled, waitForMcpResponse, writeMcpTrace, type McpRequestInfo, type McpTraceEvent } from "./tracing.js";
 import { createMcpServer } from "./tools.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
-import { CODERELAY_HOME } from "../runtime/state.js";
+import { CODERELAY_HOME, readDaemonConfig } from "../runtime/state.js";
+import { AgentCommandRuntime } from "../command/runtime.js";
 
 export interface ServeOptions {
   /** Registry location used by the single daemon. */
@@ -71,7 +72,8 @@ class StatefulMcpHandler {
 
   constructor(
     private readonly registry: WorkspaceRegistry,
-    private readonly sessions: WorkspaceSessionManager
+    private readonly sessions: WorkspaceSessionManager,
+    private readonly commandRuntime: AgentCommandRuntime
   ) {}
 
   async fetch(request: Request): Promise<Response> {
@@ -153,7 +155,7 @@ class StatefulMcpHandler {
         if (sessionId) this.removeSession(sessionId, internalId);
       }
     });
-    const product = createMcpServer({ registry: this.registry, sessions: this.sessions, sessionId: internalId });
+    const product = createMcpServer({ registry: this.registry, sessions: this.sessions, sessionId: internalId, commandRuntime: this.commandRuntime });
     const entry: SessionEntry = { internalId, transport, product };
     transport.onclose = () => {
       if (externalId) this.removeSession(externalId, internalId);
@@ -229,7 +231,12 @@ export async function startMcpServer(options: ServeOptions): Promise<RunningServ
   const endpointPath = `/mcp/${options.token}`;
   const registry = new WorkspaceRegistry(options.registryHome ?? CODERELAY_HOME);
   const sessions = new WorkspaceSessionManager();
-  const handler = new StatefulMcpHandler(registry, sessions);
+  const config = await readDaemonConfig();
+  const commandRuntime = new AgentCommandRuntime({
+    home: options.registryHome ?? CODERELAY_HOME,
+    mode: config?.commandPolicy?.mode
+  });
+  const handler = new StatefulMcpHandler(registry, sessions, commandRuntime);
   const nodeHandler = toNodeHandler(handler);
 
   const server = http.createServer((request, response) => {

@@ -36,6 +36,9 @@ import {
   type RuntimeState,
   type TransportProviderName
 } from "../runtime/state.js";
+import type { CommandPolicyMode } from "../command/model.js";
+import { ApprovalManager } from "../approval/manager.js";
+import { PolicyStore } from "../policy/store.js";
 import {
   commandExists,
   currentEntryPoint,
@@ -672,4 +675,70 @@ export async function configShowCommand(): Promise<void> {
 export async function restartCommand(options: StartOptions = {}): Promise<void> {
   await stopCommand();
   await startCommand(options);
+}
+
+export async function trustWorkspaceCommand(name: string, trusted: boolean): Promise<void> {
+  const registry = new WorkspaceRegistry(CODERELAY_HOME);
+  const workspace = await registry.get(name);
+  if (!workspace) throw new Error(`Workspace is not registered: ${name}`);
+  const store = new PolicyStore(CODERELAY_HOME);
+  if (trusted) {
+    await store.trust(workspace);
+    console.log(`Trusted workspace ${workspace.name}.`);
+  } else {
+    await store.untrust(workspace);
+    console.log(`Removed trust from workspace ${workspace.name}.`);
+  }
+}
+
+export async function trustStatusCommand(name?: string): Promise<void> {
+  const registry = new WorkspaceRegistry(CODERELAY_HOME);
+  const entries = name ? [await registry.get(name)] : await registry.list();
+  const store = new PolicyStore(CODERELAY_HOME);
+  for (const entry of entries) {
+    if (!entry) continue;
+    console.log(`${entry.name}\t${await store.isTrusted(entry) ? "trusted" : "untrusted"}`);
+  }
+  if (entries.length === 0) console.log("No matching workspaces.");
+}
+
+export async function approveCommand(requestId: string, scope: "once" | "workspace"): Promise<void> {
+  const approvals = new ApprovalManager(CODERELAY_HOME);
+  const request = await approvals.get(requestId);
+  if (!request) throw new Error(`Approval request not found or expired: ${requestId}`);
+  if (scope === "once") {
+    await approvals.approveOnce(requestId);
+    console.log(`Approved ${requestId} for one execution. Ask the agent to retry the command.`);
+    return;
+  }
+  const registry = new WorkspaceRegistry(CODERELAY_HOME);
+  const workspace = await registry.get(request.workspace);
+  if (!workspace) throw new Error(`Workspace for approval request is no longer registered: ${request.workspace}`);
+  const rules = await new PolicyStore(CODERELAY_HOME).addWorkspaceRule(workspace, request.commands);
+  await approvals.remove(requestId);
+  console.log(`Approved ${requestId} for workspace ${workspace.name} (${rules.length} rule${rules.length === 1 ? "" : "s"}). Ask the agent to retry the command.`);
+}
+
+export async function denyCommand(requestId: string): Promise<void> {
+  const removed = await new ApprovalManager(CODERELAY_HOME).remove(requestId);
+  if (!removed) throw new Error(`Approval request not found or expired: ${requestId}`);
+  console.log(`Denied ${requestId}.`);
+}
+
+export async function policyListCommand(): Promise<void> {
+  const rules = await new PolicyStore(CODERELAY_HOME).listRules();
+  console.log("ID\tWORKSPACE\tPROGRAM\tARGS (EXACT MATCH)\tSCOPE");
+  for (const rule of rules) console.log(`${rule.id}\t${rule.workspace}\t${rule.program}\t${rule.args.join(" ")}\t${rule.scope}`);
+  if (rules.length === 0) console.log("(none)");
+}
+
+export async function policyRemoveCommand(id: string): Promise<void> {
+  const removed = await new PolicyStore(CODERELAY_HOME).removeRule(id);
+  if (!removed) throw new Error(`Policy rule not found: ${id}`);
+  console.log(`Removed policy rule ${id}.`);
+}
+
+export function validateCommandPolicyMode(value: string): CommandPolicyMode {
+  if (value !== "safe" && value !== "workspace" && value !== "unrestricted") throw new Error(`Unknown command policy mode ${value}. Choose safe, workspace, or unrestricted.`);
+  return value;
 }

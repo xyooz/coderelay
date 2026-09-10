@@ -1,5 +1,6 @@
 import path from "node:path";
 import { WorkspaceSecurityError } from "../workspace/path-security.js";
+import type { StructuredCommand } from "../command/model.js";
 
 export interface ParsedCommand {
   executable: string;
@@ -7,6 +8,7 @@ export interface ParsedCommand {
 }
 
 const BLOCKED_EXECUTABLES = new Set(["sudo", "su", "shutdown", "reboot", "mkfs", "dd"]);
+const SHELL_EXECUTABLES = new Set(["sh", "bash", "zsh", "fish", "ksh", "csh"]);
 
 function hasPathEscape(value: string): boolean {
   return value === ".." || value.startsWith(`..${path.sep}`) || value.startsWith("../") || value.includes("/../") || value.includes("\\..\\");
@@ -66,6 +68,26 @@ export function parseCommand(command: string): ParsedCommand {
 
 export function validateCommand(command: string, workspaceRoot: string): ParsedCommand {
   const parsed = parseCommand(command);
+  return validateParsedCommand(parsed, workspaceRoot, true);
+}
+
+/**
+ * Validate a structured command without treating ordinary arguments as shell
+ * syntax. The command is still launched with shell:false; the stricter legacy
+ * checks remain in validateCommand for callers that use the old string API.
+ */
+export function validateStructuredCommand(command: StructuredCommand, workspaceRoot: string): ParsedCommand {
+  if (!command.program.trim() || command.program.includes("\0")) {
+    throw new WorkspaceSecurityError("command.program is empty or contains a null byte.");
+  }
+  if (/\s/u.test(command.program)) throw new WorkspaceSecurityError("command.program must not contain whitespace.");
+  if (command.args.some((argument) => argument.includes("\0"))) {
+    throw new WorkspaceSecurityError("Command arguments may not contain null bytes.");
+  }
+  return validateParsedCommand({ executable: command.program, args: command.args }, workspaceRoot, false);
+}
+
+function validateParsedCommand(parsed: ParsedCommand, workspaceRoot: string, strictLegacy: boolean): ParsedCommand {
   if (parsed.executable.startsWith("~/" ) || hasPathEscape(parsed.executable)) {
     throw new WorkspaceSecurityError("The executable may not escape the workspace.");
   }
@@ -77,24 +99,28 @@ export function validateCommand(command: string, workspaceRoot: string): ParsedC
     }
   }
   const executableName = path.basename(parsed.executable).toLowerCase();
-  if (BLOCKED_EXECUTABLES.has(executableName)) {
+  if (strictLegacy && BLOCKED_EXECUTABLES.has(executableName)) {
     throw new WorkspaceSecurityError(`Command is blocked: ${executableName}`);
   }
 
+  if (SHELL_EXECUTABLES.has(executableName) && parsed.args.some((argument) => argument === "-c" || argument === "--command" || argument === "-lc")) {
+    throw new WorkspaceSecurityError("Shell interpreters with -c/--command are blocked; use structured commands instead.");
+  }
+
   const normalized = `${executableName} ${parsed.args.join(" ")}`.toLowerCase();
-  if (executableName === "git" && /(^|\s)push(\s|$)/.test(normalized)) {
+  if (strictLegacy && executableName === "git" && /(^|\s)push(\s|$)/.test(normalized)) {
     throw new WorkspaceSecurityError("git push is disabled in the MVP.");
   }
-  if (executableName === "git" && /reset\s+--hard/.test(normalized)) {
+  if (strictLegacy && executableName === "git" && /reset\s+--hard/.test(normalized)) {
     throw new WorkspaceSecurityError("git reset --hard is disabled in the MVP.");
   }
-  if (executableName === "git" && /clean\s+-[^\s]*f/.test(normalized)) {
+  if (strictLegacy && executableName === "git" && /clean\s+-[^\s]*f/.test(normalized)) {
     throw new WorkspaceSecurityError("git clean -fd is disabled in the MVP.");
   }
-  if (executableName === "git" && /checkout\s+--\s+\.?$/.test(normalized)) {
+  if (strictLegacy && executableName === "git" && /checkout\s+--\s+\.?$/.test(normalized)) {
     throw new WorkspaceSecurityError("git checkout -- . is disabled in the MVP.");
   }
-  if (executableName === "rm" && parsed.args.some((arg) => /^-/.test(arg) && arg.includes("r"))) {
+  if (strictLegacy && executableName === "rm" && parsed.args.some((arg) => /^-/.test(arg) && arg.includes("r"))) {
     throw new WorkspaceSecurityError("Recursive rm is disabled in the MVP.");
   }
 

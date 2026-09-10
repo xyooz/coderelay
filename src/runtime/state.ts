@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import type { CommandPolicyMode } from "../command/model.js";
 
 export interface WorkspaceConfig {
   workspace: string;
@@ -104,6 +105,7 @@ export interface DaemonConfig {
   cloudflare?: CloudflareConfig;
   /** @deprecated Migrate to openai.tunnelId. */
   openaiTunnelId?: string;
+  commandPolicy?: { mode?: CommandPolicyMode };
   host?: string;
   port?: number;
 }

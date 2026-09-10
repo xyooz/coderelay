@@ -242,6 +242,17 @@ describe("CodeRelay workspace-session router", () => {
       expect(firstBindingStructured.chat_binding).toBe("attendance");
       expect(firstBindingStructured.agents.md.content).toContain("attendance tests");
 
+      const inspectCommand = await mcpCall(first.session, "tools/call", {
+        name: "run_command",
+        arguments: { command: { program: "pwd", args: [] } }
+      });
+      expect(toolText(inspectCommand)).toContain("$ pwd");
+      expect(toolStructured(inspectCommand)).toMatchObject({
+        status: "success",
+        workspace: "attendance",
+        risk: { level: "low", categories: ["inspect"] }
+      });
+
       const explicitCrossSessionRead = await mcpCall(second.session, "tools/call", {
         name: "read_file",
         arguments: { workspace: "attendance", path: "src/project.txt" }

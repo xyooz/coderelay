@@ -1,7 +1,9 @@
 import { Command, Option } from "commander";
 import {
   addWorkspaceCommand,
+  approveCommand,
   configShowCommand,
+  denyCommand,
   doctorCommand,
   endpointCommand,
   listCommand,
@@ -12,9 +14,13 @@ import {
   startCommand,
   statusCommand,
   stopCommand,
+  trustStatusCommand,
+  trustWorkspaceCommand,
+  policyListCommand,
+  policyRemoveCommand,
   workspacesCommand
 } from "./cli/commands.js";
-import { authLogoutCommand, authOpenAiCommand, authStatusCommand, configTransportCommand, setupCommand } from "./cli/setup.js";
+import { authLogoutCommand, authOpenAiCommand, authStatusCommand, configPolicyCommand, configTransportCommand, setupCommand } from "./cli/setup.js";
 import type { TransportPreference } from "./runtime/state.js";
 
 const program = new Command();
@@ -127,9 +133,54 @@ config.command("show").action(async () => configShowCommand());
 config.command("transport")
   .argument("<transport>", "auto, openai, cloudflare-named, cloudflare-quick, or local")
   .action(async (transport: string) => configTransportCommand(transport as TransportPreference));
+config.command("policy")
+  .argument("<mode>", "safe, workspace, or unrestricted")
+  .action(async (mode: string) => configPolicyCommand(mode));
+
+const trust = program
+  .command("trust")
+  .description("Trust a registered workspace for workspace-mode command execution")
+  .argument("[name]", "registered workspace name")
+  .action(async (name?: string) => {
+    if (!name) return trustStatusCommand();
+    await trustWorkspaceCommand(name, true);
+  });
+trust.command("status")
+  .description("Show workspace trust status")
+  .argument("[name]", "optional registered workspace name")
+  .action(async (name?: string) => trustStatusCommand(name));
+
+program
+  .command("untrust")
+  .description("Remove trust from a registered workspace")
+  .argument("<name>", "registered workspace name")
+  .action(async (name: string) => trustWorkspaceCommand(name, false));
+
+program
+  .command("approve")
+  .description("Approve a pending command request locally")
+  .argument("<requestId>", "approval request id")
+  .option("--once", "approve one execution")
+  .option("--workspace", "allow matching commands for this workspace")
+  .action(async (requestId: string, options: { once?: boolean; workspace?: boolean }) => {
+    if (options.once === options.workspace) throw new Error("Choose exactly one of --once or --workspace.");
+    await approveCommand(requestId, options.once ? "once" : "workspace");
+  });
+
+program
+  .command("deny")
+  .description("Deny a pending command request locally")
+  .argument("<requestId>", "approval request id")
+  .action(async (requestId: string) => denyCommand(requestId));
+
+const policy = program
+  .command("policy")
+  .description("Inspect or remove persisted command approval rules");
+policy.command("list").action(policyListCommand);
+policy.command("remove").argument("<id>", "policy rule id").action(policyRemoveCommand);
 
 const args = process.argv.slice(2);
-const commands = new Set(["start", "setup", "serve", "auth", "add", "remove", "workspaces", "stop", "status", "list", "doctor", "endpoint", "restart", "config"]);
+const commands = new Set(["start", "setup", "serve", "auth", "add", "remove", "workspaces", "stop", "status", "list", "doctor", "endpoint", "restart", "config", "trust", "untrust", "approve", "deny", "policy"]);
 if (args.length === 0) args.push("start");
 else if (!commands.has(args[0]) && !["--help", "-h", "--version", "-V"].includes(args[0])) args.unshift("start");
 
