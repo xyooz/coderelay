@@ -40,7 +40,7 @@ describe("OpenAI Secure MCP transport", () => {
       delete process.env.CONTROL_PLANE_API_KEY;
       delete process.env.CONTROL_PLANE_TUNNEL_ID;
       const provider = await selectTransport("auto", context);
-      expect(provider.name).toBe("cloudflare");
+      expect(provider.name).toBe("cloudflare-quick");
     } finally {
       if (previousKey === undefined) delete process.env.CONTROL_PLANE_API_KEY;
       else process.env.CONTROL_PLANE_API_KEY = previousKey;

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
-import { instanceLogPath } from "../runtime/state.js";
+import { instanceLogPath, readOpenAiApiKeySync } from "../runtime/state.js";
 import { terminateProcess } from "../runtime/process.js";
 import type { TunnelProcess, TunnelProvider, TunnelStartContext } from "./provider.js";
 
@@ -45,7 +45,7 @@ export function openAiTunnelId(context?: TunnelStartContext): string | undefined
 }
 
 export function hasOpenAiConfiguration(context?: TunnelStartContext): boolean {
-  return Boolean(openAiTunnelId(context) && process.env.CONTROL_PLANE_API_KEY);
+  return Boolean(openAiTunnelId(context) && readOpenAiApiKeySync().value);
 }
 
 function requireTunnelId(context: TunnelStartContext): string {
@@ -56,10 +56,12 @@ function requireTunnelId(context: TunnelStartContext): string {
   return tunnelId;
 }
 
-function requireApiKey(): void {
-  if (!process.env.CONTROL_PLANE_API_KEY) {
-    throw new Error("OpenAI Secure MCP Tunnel requires CONTROL_PLANE_API_KEY with Tunnels Read + Use.");
+function requireApiKey(): string {
+  const resolution = readOpenAiApiKeySync();
+  if (!resolution.value) {
+    throw new Error("OpenAI Secure MCP Tunnel requires an API key with Tunnels Read + Use. Set CONTROL_PLANE_API_KEY or run coderelay auth openai.");
   }
+  return resolution.value;
 }
 
 async function waitForHealthUrl(filePath: string, pid: number, timeoutMs = 30_000): Promise<string> {
@@ -89,13 +91,13 @@ export class OpenAiTunnelProvider implements TunnelProvider {
   constructor(private readonly logDirectoryResolver: LogDirectoryResolver = instanceLogPath) {}
 
   async isAvailable(context?: TunnelStartContext): Promise<boolean> {
-    if (!openAiTunnelId(context) || !process.env.CONTROL_PLANE_API_KEY) return false;
+    if (!openAiTunnelId(context) || !readOpenAiApiKeySync().value) return false;
     return resolveTunnelClient() !== null;
   }
 
   async start(context: TunnelStartContext): Promise<TunnelProcess> {
     const tunnelId = requireTunnelId(context);
-    requireApiKey();
+    const apiKey = requireApiKey();
     const executable = resolveTunnelClient();
     if (!executable) {
       throw new Error("tunnel-client was not found. Install it from OpenAI Platform Tunnels or set CODERELAY_TUNNEL_CLIENT.");
@@ -119,7 +121,7 @@ export class OpenAiTunnelProvider implements TunnelProvider {
     ], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
-      env: { ...process.env, CONTROL_PLANE_TUNNEL_ID: tunnelId }
+      env: { ...process.env, CONTROL_PLANE_API_KEY: apiKey, CONTROL_PLANE_TUNNEL_ID: tunnelId }
     });
     fsSync.closeSync(logFd);
     child.unref();

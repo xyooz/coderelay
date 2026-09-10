@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -8,13 +9,43 @@ export interface WorkspaceConfig {
   port: number;
   safeMode: boolean;
   instanceName?: string;
-  transport?: "auto" | "openai" | "cloudflare";
+  transport?: TransportPreference | "cloudflare";
   openaiTunnelId?: string;
   /** @deprecated Kept so older .coderelay/config.json files can be read. */
   tunnelProvider?: "cloudflared";
 }
 
-export type TransportProviderName = "openai" | "cloudflare";
+export type TransportPreference = "auto" | "openai" | "cloudflare-named" | "cloudflare-quick" | "local";
+export type TransportProviderName = Exclude<TransportPreference, "auto">;
+
+export interface TransportConfig {
+  preferred: TransportPreference;
+  fallback?: TransportPreference;
+}
+
+export interface OpenAiConfig {
+  tunnelId?: string;
+}
+
+export interface CloudflareConfig {
+  tunnel?: string;
+  hostname?: string;
+  configPath?: string;
+  credentialsFile?: string;
+}
+
+export interface CredentialsFile {
+  openai?: {
+    apiKey?: string;
+  };
+}
+
+export type ApiKeySource = "environment" | "credentials" | "missing";
+
+export interface ApiKeyResolution {
+  value?: string;
+  source: ApiKeySource;
+}
 
 export interface RuntimeState {
   instanceName: string;
@@ -26,6 +57,8 @@ export interface RuntimeState {
   port: number;
   token: string;
   transportProvider: TransportProviderName | "disabled";
+  transportPreference?: TransportPreference;
+  transportFallbackReason?: string;
   transportExecutable?: string;
   transportBaseUrl?: string;
   transportHealthUrl?: string;
@@ -39,13 +72,17 @@ export interface RuntimeState {
 export interface InstanceRecord {
   instanceName: string;
   workspace: string;
-  transport: "auto" | "openai" | "cloudflare";
+  transport: TransportPreference | "cloudflare";
   openaiTunnelId?: string;
   updatedAt: string;
 }
 
 export interface DaemonConfig {
-  transport?: "auto" | "openai" | "cloudflare";
+  /** New structured transport settings. A string is accepted for legacy configs. */
+  transport?: TransportConfig | TransportPreference | "cloudflare";
+  openai?: OpenAiConfig;
+  cloudflare?: CloudflareConfig;
+  /** @deprecated Migrate to openai.tunnelId. */
   openaiTunnelId?: string;
   host?: string;
   port?: number;
@@ -59,6 +96,7 @@ export const DAEMON_PATH = path.join(CODERELAY_HOME, "daemon");
 export const DAEMON_RUNTIME_PATH = path.join(DAEMON_PATH, "runtime.json");
 export const DAEMON_LOG_PATH = path.join(DAEMON_PATH, "logs");
 export const DAEMON_CONFIG_PATH = path.join(CODERELAY_HOME, "config.json");
+export const CREDENTIALS_PATH = path.join(CODERELAY_HOME, "credentials.json");
 /** @deprecated Use instanceRuntimePath() for new state. */
 export const RUNTIME_PATH = path.join(CODERELAY_HOME, "runtime.json");
 /** @deprecated Use instanceLogPath() for new state. */
@@ -92,31 +130,121 @@ export function instanceLogPath(instanceName: string): string {
   return path.join(instanceDirectory(instanceName), "logs");
 }
 
-async function ensureDirectory(directory: string): Promise<void> {
+async function ensureDirectory(directory: string, mode = 0o700): Promise<void> {
   await fs.mkdir(directory, { recursive: true });
+  await fs.chmod(directory, mode).catch(() => undefined);
 }
 
 export async function ensureGlobalStateDirectories(): Promise<void> {
+  await ensureDirectory(CODERELAY_HOME, 0o700);
   await ensureDirectory(INSTANCES_PATH);
   await ensureDirectory(DAEMON_PATH);
 }
 
 export async function ensureDaemonStateDirectories(): Promise<void> {
+  await ensureDirectory(CODERELAY_HOME, 0o700);
   await ensureDirectory(DAEMON_PATH);
   await ensureDirectory(DAEMON_LOG_PATH);
 }
 
+async function writePrivateJson(filePath: string, value: unknown): Promise<void> {
+  await ensureDirectory(path.dirname(filePath), 0o700);
+  const temporaryPath = `${filePath}.tmp-${process.pid}`;
+  await fs.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await fs.chmod(temporaryPath, 0o600);
+  await fs.rename(temporaryPath, filePath);
+  await fs.chmod(filePath, 0o600);
+}
+
 export async function writeDaemonConfig(config: DaemonConfig): Promise<void> {
-  await ensureDirectory(CODERELAY_HOME);
-  await fs.writeFile(DAEMON_CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  await writePrivateJson(DAEMON_CONFIG_PATH, config);
 }
 
 export async function readDaemonConfig(): Promise<DaemonConfig | null> {
   try {
-    return JSON.parse(await fs.readFile(DAEMON_CONFIG_PATH, "utf8")) as DaemonConfig;
+    const parsed = JSON.parse(await fs.readFile(DAEMON_CONFIG_PATH, "utf8")) as DaemonConfig;
+    return normalizeDaemonConfig(parsed);
   } catch {
     return null;
   }
+}
+
+function normalizeTransport(value: unknown): TransportPreference {
+  if (value === "openai" || value === "cloudflare-named" || value === "cloudflare-quick" || value === "local" || value === "auto") return value;
+  if (value === "cloudflare") return "cloudflare-quick";
+  return "auto";
+}
+
+export function normalizeDaemonConfig(raw: DaemonConfig): DaemonConfig {
+  const rawTransport = raw.transport;
+  const preferred = typeof rawTransport === "object" && rawTransport !== null
+    ? normalizeTransport(rawTransport.preferred)
+    : normalizeTransport(rawTransport);
+  const fallback = typeof rawTransport === "object" && rawTransport !== null && rawTransport.fallback !== undefined
+    ? normalizeTransport(rawTransport.fallback)
+    : preferred === "openai" || preferred === "cloudflare-named" ? "cloudflare-quick" : undefined;
+  return {
+    ...raw,
+    transport: { preferred, ...(fallback ? { fallback } : {}) },
+    openai: raw.openai ?? (raw.openaiTunnelId ? { tunnelId: raw.openaiTunnelId } : undefined)
+  };
+}
+
+export function resolveTransportConfig(config: DaemonConfig | null): TransportConfig {
+  const normalized = config ? normalizeDaemonConfig(config) : null;
+  const transport = normalized?.transport;
+  if (transport && typeof transport === "object") return transport;
+  const preferred = normalizeTransport(transport);
+  return {
+    preferred,
+    ...(preferred === "openai" || preferred === "cloudflare-named" ? { fallback: "cloudflare-quick" as const } : {})
+  };
+}
+
+export function resolveConfiguredOpenAiTunnelId(config: Pick<DaemonConfig, "openai" | "openaiTunnelId"> | null): string | undefined {
+  return config?.openai?.tunnelId ?? config?.openaiTunnelId;
+}
+
+export function readOpenAiApiKeySync(environmentValue = process.env.CONTROL_PLANE_API_KEY, credentialsPath = CREDENTIALS_PATH): ApiKeyResolution {
+  if (environmentValue) return { value: environmentValue, source: "environment" };
+  try {
+    const parsed = JSON.parse(fsSync.readFileSync(credentialsPath, "utf8")) as CredentialsFile;
+    if (parsed.openai?.apiKey) return { value: parsed.openai.apiKey, source: "credentials" };
+  } catch {
+    // A missing or malformed credentials file is equivalent to missing auth.
+  }
+  return { source: "missing" };
+}
+
+export async function readCredentials(credentialsPath = CREDENTIALS_PATH): Promise<CredentialsFile | null> {
+  try {
+    return JSON.parse(await fs.readFile(credentialsPath, "utf8")) as CredentialsFile;
+  } catch {
+    return null;
+  }
+}
+
+export async function writeCredentials(credentials: CredentialsFile, credentialsPath = CREDENTIALS_PATH): Promise<void> {
+  await writePrivateJson(credentialsPath, credentials);
+}
+
+export async function writeOpenAiApiKey(apiKey: string, credentialsPath = CREDENTIALS_PATH): Promise<void> {
+  const current = await readCredentials(credentialsPath);
+  await writeCredentials({ ...current, openai: { ...(current?.openai ?? {}), apiKey } }, credentialsPath);
+}
+
+export async function removeOpenAiApiKey(credentialsPath = CREDENTIALS_PATH): Promise<void> {
+  const current = await readCredentials(credentialsPath);
+  if (!current?.openai) return;
+  const next = { ...current };
+  delete next.openai;
+  if (Object.keys(next).length === 0) {
+    await fs.unlink(credentialsPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    });
+    return;
+  }
+  await writeCredentials(next, credentialsPath);
 }
 
 export async function ensureInstanceStateDirectories(instanceName: string): Promise<void> {
@@ -207,6 +335,14 @@ export async function writeDaemonRuntimeState(state: RuntimeState): Promise<void
 
 function normalizeRuntimeState(raw: Partial<RuntimeState> & { tunnelPid?: number; tunnelProvider?: "cloudflared"; tunnelExecutable?: string; tunnelBaseUrl?: string; tunnelLog?: string }): RuntimeState {
   const instanceName = raw.instanceName ?? defaultInstanceName(raw.workspace ?? "workspace");
+  const rawProvider = raw.transportProvider as string | undefined;
+  const transportProvider: RuntimeState["transportProvider"] = rawProvider === "cloudflare"
+    ? "cloudflare-quick"
+    : rawProvider === "openai" || rawProvider === "cloudflare-named" || rawProvider === "cloudflare-quick" || rawProvider === "local" || rawProvider === "disabled"
+      ? rawProvider
+      : raw.tunnelProvider
+        ? "cloudflare-quick"
+        : "disabled";
   return {
     instanceName,
     pid: raw.pid ?? 0,
@@ -216,7 +352,7 @@ function normalizeRuntimeState(raw: Partial<RuntimeState> & { tunnelPid?: number
     host: raw.host ?? "127.0.0.1",
     port: raw.port ?? 0,
     token: raw.token ?? "",
-    transportProvider: raw.transportProvider ?? (raw.tunnelProvider ? "cloudflare" : "disabled"),
+    transportProvider,
     transportExecutable: raw.transportExecutable ?? raw.tunnelExecutable,
     transportBaseUrl: raw.transportBaseUrl ?? raw.tunnelBaseUrl,
     transportHealthUrl: raw.transportHealthUrl,

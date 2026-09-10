@@ -6,6 +6,10 @@ export interface TunnelStartContext {
   workspace: string;
   instanceName: string;
   openaiTunnelId?: string;
+  cloudflareTunnel?: string;
+  cloudflareHostname?: string;
+  cloudflareConfigPath?: string;
+  cloudflareCredentialsFile?: string;
 }
 
 export interface TunnelProcess {

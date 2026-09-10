@@ -52,28 +52,56 @@ run_command({ workspace: "attendance", command: "npm test" })
 
 ## Secure transport
 
-CodeRelay automatically prefers the official OpenAI Secure MCP Tunnel when all of these are available:
-
-- `CONTROL_PLANE_API_KEY` in the environment
-- a configured tunnel ID
-- the official `tunnel-client` executable
-
-The API key is read only from the environment. It is never written to the registry, project, or runtime state.
-
-Configure a tunnel ID once for the daemon:
+The first interactive `coderelay` run can guide you through transport setup. You can also open it explicitly:
 
 ```bash
-export CONTROL_PLANE_API_KEY="sk-..."
-coderelay --tunnel-id "tunnel_..."
+coderelay setup
 ```
 
-When OpenAI transport is unavailable in automatic mode, CodeRelay falls back to a Cloudflare Quick Tunnel. No Cloudflare account or API key is required. An existing `cloudflared` on `PATH` is preferred; otherwise CodeRelay downloads a pinned official binary and verifies its SHA256 before execution.
+CodeRelay supports four transports:
 
-Force a provider when needed:
+- `openai` — OpenAI Secure MCP Tunnel, preferred when configured
+- `cloudflare-named` — an existing Cloudflare tunnel that you own
+- `cloudflare-quick` — zero-configuration fallback
+- `local` — loopback only, equivalent to local testing
+
+Choose a transport for the current run without changing saved preferences:
 
 ```bash
 coderelay --transport openai
-coderelay --transport cloudflare
+coderelay --transport cloudflare-named
+coderelay --transport cloudflare-quick
+coderelay --transport local
+coderelay --no-tunnel
+```
+
+Saved non-secret settings live in `~/.coderelay/config.json`. The OpenAI API key, if saved, lives separately in `~/.coderelay/credentials.json` with mode `0600`; `~/.coderelay` is kept at mode `0700`.
+
+OpenAI credentials use this precedence:
+
+1. `CONTROL_PLANE_API_KEY`
+2. the local credentials file
+3. missing
+
+Manage the local credential without revealing it:
+
+```bash
+coderelay auth openai
+coderelay auth status
+coderelay auth logout
+```
+
+The OpenAI tunnel ID uses CLI `--tunnel-id` first, then saved config, then `CONTROL_PLANE_TUNNEL_ID`. The key is never written to project config, runtime state, logs, traces, status output, or command-line arguments.
+
+OpenAI transport uses the official `tunnel-client`. When automatic selection cannot use it, CodeRelay explicitly reports the reason and falls back to `cloudflare-quick`. No Cloudflare account or API key is required for a Quick Tunnel. An existing `cloudflared` on `PATH` is preferred; otherwise CodeRelay downloads a pinned official binary and verifies its SHA256 before execution.
+
+For a Cloudflare Named Tunnel, authenticate and create the tunnel with Cloudflare's local-management workflow, then select `cloudflare-named` and provide its name/ID plus hostname. CodeRelay only runs the existing tunnel; it does not create, delete, or manage Cloudflare account resources.
+
+Inspect the saved non-secret settings with:
+
+```bash
+coderelay config show
+coderelay config transport openai
 ```
 
 For local-only testing:
@@ -82,7 +110,7 @@ For local-only testing:
 coderelay --no-tunnel
 ```
 
-The daemon and local MCP server remain available while a public tunnel is warming up. `coderelay status` and `coderelay doctor` distinguish the local MCP process, transport process, and public endpoint.
+The daemon and local MCP server remain available while a public tunnel is warming up. `coderelay status` and `coderelay doctor` distinguish the local MCP process, transport process, and public endpoint. Missing credentials and setup problems include the relevant official remediation links.
 
 For diagnosing MCP session behavior, start the daemon with request tracing enabled:
 
