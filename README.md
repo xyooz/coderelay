@@ -2,7 +2,7 @@
 
 **Turn ChatGPT into a local coding agent in 30 seconds.**
 
-No API key. No copy-paste. No manual MCP configuration.
+No Cloudflare account or API key is required when CodeRelay uses the default Cloudflare Quick Tunnel.
 
 ```bash
 cd your-project
@@ -25,19 +25,24 @@ CodeRelay gives ChatGPT a small, safe toolset for your current repository:
 
 ## Requirements
 
-- Node.js 22 or newer
+- Node.js 20 or newer
 - Git
 - Internet access on first start so CodeRelay can download its tunnel runtime
 
 CodeRelay prefers OpenAI Secure MCP Tunnel when `CONTROL_PLANE_TUNNEL_ID`, `CONTROL_PLANE_API_KEY`, and `tunnel-client` are available. The API key is read only from the environment and is never written to the project or runtime state. Install the official client from OpenAI Platform Tunnels or set `CODERELAY_TUNNEL_CLIENT` to its path.
 
-For OpenAI Secure MCP Tunnel, configure the official client once in your shell, then run CodeRelay normally:
+For OpenAI Secure MCP Tunnel, bind a tunnel to a workspace once, then run CodeRelay normally:
 
 ```bash
-export CONTROL_PLANE_TUNNEL_ID="tunnel_..."
 export CONTROL_PLANE_API_KEY="sk-..." # restricted runtime key with Tunnels Read + Use
+cd ~/Projects/a
+coderelay --tunnel-id "tunnel_..."
+
+# Later runs in this workspace only need:
 coderelay
 ```
+
+The tunnel ID is saved in `.coderelay/config.json` for this workspace. `--tunnel-id` overrides the saved value; `CONTROL_PLANE_TUNNEL_ID` is used only when neither is set. The API key is never written to disk.
 
 If OpenAI Secure MCP Tunnel is not configured, CodeRelay falls back to a Cloudflare Quick Tunnel. It does not require a Cloudflare account, API key, `sudo`, or a package manager. If `cloudflared` is already on `PATH`, CodeRelay uses it; otherwise it downloads a verified platform binary into `~/.coderelay/bin/` and reuses it on later starts.
 
@@ -48,6 +53,7 @@ coderelay              # same as coderelay start
 coderelay start
 coderelay ~/Projects/a
 coderelay --name attendance-client
+coderelay --tunnel-id tunnel_...
 coderelay --transport openai
 coderelay --transport cloudflare
 coderelay list

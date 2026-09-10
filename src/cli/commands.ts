@@ -40,6 +40,7 @@ import {
 export interface StartOptions {
   workspace?: string;
   name?: string;
+  tunnelId?: string;
   port?: number;
   transport?: TransportPreference;
   tunnel?: boolean;
@@ -73,6 +74,14 @@ function serverChildCommand(args: string[]): { command: string; args: string[] }
 function configuredTransport(config: WorkspaceConfig | null): TransportPreference {
   if (config?.transport) return config.transport;
   return "auto";
+}
+
+export function resolveOpenAiTunnelId(
+  explicitTunnelId: string | undefined,
+  config: Pick<WorkspaceConfig, "openaiTunnelId"> | null,
+  environmentTunnelId = process.env.CONTROL_PLANE_TUNNEL_ID
+): string | undefined {
+  return explicitTunnelId ?? config?.openaiTunnelId ?? environmentTunnelId;
 }
 
 async function resolveInstanceName(workspace: string, requestedName: string | undefined, config: WorkspaceConfig | null): Promise<string> {
@@ -209,7 +218,7 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
   const port = await findAvailablePort(preferredPort, host);
   const useTunnel = options.tunnel !== false;
   const preference = options.transport ?? configuredTransport(previousConfig);
-  const openaiTunnelId = process.env.CONTROL_PLANE_TUNNEL_ID ?? previousConfig?.openaiTunnelId;
+  const openaiTunnelId = resolveOpenAiTunnelId(options.tunnelId, previousConfig);
   const config: WorkspaceConfig = {
     workspace: workspaceInfo.root,
     host,
@@ -460,7 +469,7 @@ export async function doctorCommand(workspacePath = process.cwd(), instanceName?
   const checks: Array<{ label: string; ok: boolean; detail?: string }> = [];
   let diagnosis: string | undefined;
   const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
-  checks.push({ label: `Node.js ${process.versions.node}`, ok: nodeMajor >= 22, detail: "Node.js 22 or newer is required." });
+  checks.push({ label: `Node.js ${process.versions.node}`, ok: nodeMajor >= 20, detail: "Node.js 20 or newer is required." });
   checks.push({ label: "Git available", ok: commandExists("git"), detail: "Install Git and retry." });
   try {
     const info = await detectWorkspace(workspace);

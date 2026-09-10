@@ -45,7 +45,7 @@ export function openAiTunnelId(context?: TunnelStartContext): string | undefined
 }
 
 export function hasOpenAiConfiguration(context?: TunnelStartContext): boolean {
-  return Boolean(openAiTunnelId(context) || process.env.CONTROL_PLANE_API_KEY);
+  return Boolean(openAiTunnelId(context) && process.env.CONTROL_PLANE_API_KEY);
 }
 
 function requireTunnelId(context: TunnelStartContext): string {

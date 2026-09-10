@@ -2,8 +2,9 @@ import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { resolveOpenAiTunnelId } from "../src/cli/commands.js";
 import { isProcessAlive } from "../src/runtime/state.js";
-import { OpenAiTunnelProvider, resolveTunnelClient } from "../src/tunnel/openai.js";
+import { hasOpenAiConfiguration, OpenAiTunnelProvider, resolveTunnelClient } from "../src/tunnel/openai.js";
 import { selectTransport } from "../src/tunnel/selection.js";
 
 const context = {
@@ -45,6 +46,26 @@ describe("OpenAI Secure MCP transport", () => {
       else process.env.CONTROL_PLANE_API_KEY = previousKey;
       if (previousId === undefined) delete process.env.CONTROL_PLANE_TUNNEL_ID;
       else process.env.CONTROL_PLANE_TUNNEL_ID = previousId;
+    }
+  });
+
+  it("resolves workspace tunnel bindings before the global environment fallback", () => {
+    expect(resolveOpenAiTunnelId("tunnel_cli", { openaiTunnelId: "tunnel_config" }, "tunnel_env")).toBe("tunnel_cli");
+    expect(resolveOpenAiTunnelId(undefined, { openaiTunnelId: "tunnel_config" }, "tunnel_env")).toBe("tunnel_config");
+    expect(resolveOpenAiTunnelId(undefined, null, "tunnel_env")).toBe("tunnel_env");
+    expect(resolveOpenAiTunnelId(undefined, null, undefined)).toBeUndefined();
+  });
+
+  it("only reports complete OpenAI configuration when both tunnel ID and API key exist", () => {
+    const previousKey = process.env.CONTROL_PLANE_API_KEY;
+    try {
+      delete process.env.CONTROL_PLANE_API_KEY;
+      expect(hasOpenAiConfiguration(context)).toBe(false);
+      process.env.CONTROL_PLANE_API_KEY = "test-runtime-key";
+      expect(hasOpenAiConfiguration(context)).toBe(true);
+    } finally {
+      if (previousKey === undefined) delete process.env.CONTROL_PLANE_API_KEY;
+      else process.env.CONTROL_PLANE_API_KEY = previousKey;
     }
   });
 

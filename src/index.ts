@@ -22,10 +22,11 @@ program
   .argument("[workspace]", "workspace directory", process.cwd())
   .option("--workspace <path>", "workspace directory (legacy alias)")
   .option("--name <name>", "instance name")
+  .option("--tunnel-id <id>", "OpenAI Secure MCP Tunnel ID for this workspace")
   .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare"]))
   .option("--port <number>", "preferred local port", (value) => Number.parseInt(value, 10))
   .option("--no-tunnel", "start locally without a public tunnel")
-  .action(async (workspace: string | undefined, options: { workspace?: string; name?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => startCommand({ ...options, workspace: options.workspace ?? workspace }));
+  .action(async (workspace: string | undefined, options: { workspace?: string; name?: string; tunnelId?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => startCommand({ ...options, workspace: options.workspace ?? workspace }));
 
 program
   .command("serve", { hidden: true })
@@ -66,10 +67,11 @@ program
   .argument("[instanceName]", "instance name")
   .option("--workspace <path>", "workspace directory")
   .option("--name <name>", "instance name override")
+  .option("--tunnel-id <id>", "OpenAI Secure MCP Tunnel ID for this workspace")
   .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare"]))
   .option("--port <number>", "preferred local port", (value) => Number.parseInt(value, 10))
   .option("--no-tunnel", "restart locally without a public tunnel")
-  .action(async (instanceName: string | undefined, options: { workspace?: string; name?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => restartCommand(instanceName, options));
+  .action(async (instanceName: string | undefined, options: { workspace?: string; name?: string; tunnelId?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => restartCommand(instanceName, options));
 
 program
   .command("config")

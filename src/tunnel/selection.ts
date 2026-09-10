@@ -14,7 +14,7 @@ export async function selectTransport(
   const openai = new OpenAiTunnelProvider();
   if (preference === "openai") {
     if (!await openai.isAvailable(context)) {
-      throw new Error("OpenAI Secure MCP Tunnel is not available. Set CONTROL_PLANE_TUNNEL_ID, CONTROL_PLANE_API_KEY, and install tunnel-client.");
+      throw new Error("OpenAI Secure MCP Tunnel is not available. Set CONTROL_PLANE_API_KEY, bind a tunnel with --tunnel-id or workspace config, and install tunnel-client.");
     }
     return openai;
   }
