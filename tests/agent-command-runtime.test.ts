@@ -29,6 +29,10 @@ describe("Agent Command Runtime", () => {
       expect(result.risk.level).toBe("low");
       expect(result.risk.categories).toContain("inspect");
       expect(result.execution?.exit_code).toBe(0);
+      expect(result.policy.rule).toBe("safe-inspect");
+      const workspaceInspect = await new AgentCommandRuntime({ home: setup.home, mode: "workspace" }).run(setup.entry, { command: "pwd" });
+      expect(workspaceInspect.status).toBe("success");
+      expect(workspaceInspect.policy.rule).toBe("workspace-inspect");
       await expect(runtime.run(setup.entry, { command: "pwd && ls" })).rejects.toThrow("Shell operators");
     } finally {
       await rm(setup.home, { recursive: true, force: true });
@@ -77,8 +81,11 @@ describe("Agent Command Runtime", () => {
       await writeFile(path.join(setup.workspace, "trusted.js"), "process.stdout.write('trusted')\n");
       const command = { command: { program: "node", args: ["trusted.js"] } };
       expect((await workspaceRuntime.run(setup.entry, command)).status).toBe("approval_required");
+      expect((await workspaceRuntime.run(setup.entry, command)).policy.rule).toBe("workspace-approval-required");
       await store.trust(setup.entry);
-      expect((await workspaceRuntime.run(setup.entry, command)).status).toBe("success");
+      const trustedResult = await workspaceRuntime.run(setup.entry, command);
+      expect(trustedResult.status).toBe("success");
+      expect(trustedResult.policy.rule).toBe("trusted-workspace-exec");
 
       const pushRisk = analyzeCommand({ program: "git", args: ["push"] });
       expect(pushRisk.categories).toEqual(expect.arrayContaining(["network", "external-write"]));
@@ -112,7 +119,7 @@ describe("Agent Command Runtime", () => {
 
       const workspaceResult = await new AgentCommandRuntime({ home: setup.home, mode: "workspace" }).run(setup.entry, inline);
       expect(workspaceResult.status).toBe("approval_required");
-      expect(workspaceResult.policy.rule).toBe("sensitive-operation");
+      expect(workspaceResult.policy.rule).toBe("workspace-approval-required");
 
       for (const command of [
         { program: "node", args: ["--eval", "1 + 1"] },
@@ -228,7 +235,7 @@ describe("Agent Command Runtime", () => {
         workspace: setup.entry.name,
         command: { program: "curl", args: ["--token", "secret-api-key", "API_KEY=another-secret"] },
         risk: { level: "high", categories: ["network"], reasons: ["network"] },
-        policy: { mode: "safe", decision: "deny", rule: "safe-mode" },
+        policy: { mode: "safe", decision: "deny", rule: "safe-approval-required" },
         approval: { required: false, source: "policy" }
       });
       const auditText = await readFile(audit.filePath, "utf8");

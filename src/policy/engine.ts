@@ -57,15 +57,22 @@ export class PolicyEngine {
       return {
         mode,
         decision: "approval_required",
-        rule: mode === "safe" ? "safe-mode" : mode === "workspace" && !trusted ? "untrusted-workspace" : "sensitive-operation",
+        rule: mode === "safe" ? "safe-approval-required" : "workspace-approval-required",
         approvalRequired: true,
         approvalSource: "none"
       };
     }
+    const isInspectOnly = assessments.every((assessment) => categoriesAllowed(assessment.categories, SAFE_CATEGORIES));
     return {
       mode,
       decision: "allow",
-      rule: mode === "unrestricted" ? "unrestricted-mode" : "trusted-workspace-exec",
+      rule: mode === "unrestricted"
+        ? "unrestricted-mode"
+        : mode === "safe"
+          ? "safe-inspect"
+          : isInspectOnly
+            ? "workspace-inspect"
+            : "trusted-workspace-exec",
       approvalRequired: false,
       approvalSource: "policy"
     };
