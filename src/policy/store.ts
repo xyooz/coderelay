@@ -9,7 +9,8 @@ export interface PolicyRule {
   id: string;
   workspace: string;
   program: string;
-  argsPrefix: string[];
+  args: string[];
+  match: "exact";
   decision: "allow";
   scope: "workspace";
   createdAt: string;
@@ -33,6 +34,31 @@ function emptyPolicyFile(): PolicyFile {
   return { version: 1, trustedWorkspaces: [], rules: [] };
 }
 
+function normalizeRule(raw: unknown): PolicyRule | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Partial<PolicyRule> & { argsPrefix?: unknown; match?: unknown };
+  if (typeof value.id !== "string" || typeof value.workspace !== "string" || typeof value.program !== "string") return null;
+
+  // Older policy files used argsPrefix. Read it for compatibility, but always
+  // normalize the in-memory and rewritten rule to exact argument matching.
+  const args = Array.isArray(value.args)
+    ? value.args
+    : Array.isArray(value.argsPrefix)
+      ? value.argsPrefix
+      : null;
+  if (!args || args.some((argument) => typeof argument !== "string")) return null;
+  return {
+    id: value.id,
+    workspace: value.workspace,
+    program: value.program,
+    args: [...args],
+    match: "exact",
+    decision: "allow",
+    scope: "workspace",
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date(0).toISOString()
+  };
+}
+
 function normalizePolicyFile(raw: unknown): PolicyFile {
   if (!raw || typeof raw !== "object") return emptyPolicyFile();
   const value = raw as Partial<PolicyFile>;
@@ -40,7 +66,7 @@ function normalizePolicyFile(raw: unknown): PolicyFile {
     ? value.trustedWorkspaces.filter((entry): entry is string => typeof entry === "string")
     : [];
   const rules = Array.isArray(value.rules)
-    ? value.rules.filter((rule): rule is PolicyRule => Boolean(rule && typeof rule === "object" && typeof (rule as PolicyRule).id === "string" && typeof (rule as PolicyRule).workspace === "string" && typeof (rule as PolicyRule).program === "string" && Array.isArray((rule as PolicyRule).argsPrefix)))
+    ? value.rules.map(normalizeRule).filter((rule): rule is PolicyRule => Boolean(rule))
     : [];
   return { version: 1, trustedWorkspaces: [...new Set(trustedWorkspaces)], rules };
 }
@@ -88,7 +114,7 @@ export class PolicyStore {
     const data = await this.read();
     const created: PolicyRule[] = [];
     for (const command of commands) {
-      const duplicate = data.rules.find((rule) => rule.workspace === workspace.id && rule.program === command.program && sameArgs(rule.argsPrefix, command.args));
+      const duplicate = data.rules.find((rule) => rule.workspace === workspace.id && rule.program === command.program && sameArgs(rule.args, command.args));
       if (duplicate) {
         created.push(duplicate);
         continue;
@@ -97,7 +123,8 @@ export class PolicyStore {
         id: `pol_${randomBytes(10).toString("hex")}`,
         workspace: workspace.id,
         program: command.program,
-        argsPrefix: [...command.args],
+        args: [...command.args],
+        match: "exact",
         decision: "allow",
         scope: "workspace",
         createdAt: new Date().toISOString()
@@ -123,7 +150,7 @@ export class PolicyStore {
     return data.rules.find((rule) =>
       (rule.workspace === workspace.id || rule.workspace === workspace.name)
       && rule.program === command.program
-      && sameArgs(rule.argsPrefix, command.args)
+      && sameArgs(rule.args, command.args)
     ) ?? null;
   }
 
@@ -138,11 +165,10 @@ export class PolicyStore {
   }
 }
 
-function sameArgs(prefix: string[], args: string[]): boolean {
-  return prefix.length <= args.length && prefix.every((argument, index) => argument === args[index]);
+function sameArgs(expected: string[], actual: string[]): boolean {
+  return expected.length === actual.length && expected.every((argument, index) => argument === actual[index]);
 }
 
 export function policyRuleFingerprint(rule: PolicyRule): string {
-  return commandFingerprint([{ program: rule.program, args: rule.argsPrefix }], rule.workspace, true, 0);
+  return commandFingerprint([{ program: rule.program, args: rule.args }], rule.workspace, true, 0);
 }
-

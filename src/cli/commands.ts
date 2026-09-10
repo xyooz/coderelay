@@ -727,8 +727,8 @@ export async function denyCommand(requestId: string): Promise<void> {
 
 export async function policyListCommand(): Promise<void> {
   const rules = await new PolicyStore(CODERELAY_HOME).listRules();
-  console.log("ID\tWORKSPACE\tPROGRAM\tARGS PREFIX\tSCOPE");
-  for (const rule of rules) console.log(`${rule.id}\t${rule.workspace}\t${rule.program}\t${rule.argsPrefix.join(" ")}\t${rule.scope}`);
+  console.log("ID\tWORKSPACE\tPROGRAM\tARGS (EXACT MATCH)\tSCOPE");
+  for (const rule of rules) console.log(`${rule.id}\t${rule.workspace}\t${rule.program}\t${rule.args.join(" ")}\t${rule.scope}`);
   if (rules.length === 0) console.log("(none)");
 }
 

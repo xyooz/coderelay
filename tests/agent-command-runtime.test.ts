@@ -132,6 +132,49 @@ describe("Agent Command Runtime", () => {
     }
   });
 
+  it("requires exact workspace approval rules and checks hard-deny first", async () => {
+    const setup = await setupWorkspace();
+    try {
+      const store = new PolicyStore(setup.home);
+      const policy = new PolicyEngine(store);
+      const evaluate = (command: { program: string; args: string[] }, mode: "safe" | "unrestricted" = "safe") =>
+        policy.evaluate(setup.entry, [command], [analyzeCommand(command)], mode, true, false);
+
+      const approvedPush = { program: "git", args: ["push", "origin", "main"] };
+      expect((await evaluate(approvedPush)).decision).toBe("approval_required");
+      await store.addWorkspaceRule(setup.entry, [approvedPush]);
+      expect((await evaluate(approvedPush)).decision).toBe("allow");
+
+      const forcePush = { program: "git", args: ["push", "origin", "main", "--force"] };
+      expect((await evaluate(forcePush)).decision).toBe("approval_required");
+
+      const approvedCurl = { program: "curl", args: ["https://example.com"] };
+      await store.addWorkspaceRule(setup.entry, [approvedCurl]);
+      const curlWithData = { program: "curl", args: ["https://example.com", "--data", "payload"] };
+      expect((await evaluate(curlWithData)).decision).toBe("approval_required");
+
+      const approvedNpm = { program: "npm", args: ["test"] };
+      await store.addWorkspaceRule(setup.entry, [approvedNpm]);
+      const npmWithExtraArgs = { program: "npm", args: ["test", "--", "--runInBand"] };
+      expect((await evaluate(npmWithExtraArgs)).decision).toBe("approval_required");
+
+      const hardDenied = { program: "rm", args: ["-rf", "/"] };
+      await store.addWorkspaceRule(setup.entry, [hardDenied]);
+      const hardDecision = await evaluate(hardDenied, "unrestricted");
+      expect(hardDecision.decision).toBe("deny");
+      expect(hardDecision.rule).toBe("hard-deny");
+
+      const rules = await store.listRules();
+      expect(rules.find((rule) => rule.program === "git" && rule.args.join(" ") === "push origin main")).toMatchObject({
+        args: ["push", "origin", "main"],
+        match: "exact"
+      });
+    } finally {
+      await rm(setup.home, { recursive: true, force: true });
+      await rm(setup.workspace, { recursive: true, force: true });
+    }
+  });
+
   it("runs structured sequences, stops on failure, handles timeout, and truncates output", async () => {
     const setup = await setupWorkspace();
     try {

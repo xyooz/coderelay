@@ -88,6 +88,8 @@ coderelay policy list
 coderelay policy remove <rule-id>
 ```
 
+Workspace approvals are exact-match rules: the workspace, program, argument count, and every argument must match. `coderelay policy list` labels the stored arguments as `ARGS (EXACT MATCH)`; approving `git push origin main` does not approve `git push origin main --force`.
+
 `workspace` mode allows inspection by default and requires a trusted workspace for workspace writes or execution. Network, external writes, destructive, and privileged operations still require approval. `unrestricted` removes those approval prompts except for hard-denied commands such as deleting the filesystem root. The policy store and pending approvals are kept under `~/.coderelay/policies/` with restrictive permissions; the audit log is `~/.coderelay/audit.log` and does not include command output, environment variables, or inline credentials.
 
 Command policy is authoritative on the user side (`~/.coderelay/config.json` and the policy store). A project-controlled `.coderelay/config.json` cannot widen the daemon policy; any future project-level policy must only make it stricter.
