@@ -90,6 +90,10 @@ coderelay policy remove <rule-id>
 
 `workspace` mode allows inspection by default and requires a trusted workspace for workspace writes or execution. Network, external writes, destructive, and privileged operations still require approval. `unrestricted` removes those approval prompts except for hard-denied commands such as deleting the filesystem root. The policy store and pending approvals are kept under `~/.coderelay/policies/` with restrictive permissions; the audit log is `~/.coderelay/audit.log` and does not include command output, environment variables, or inline credentials.
 
+Command policy is authoritative on the user side (`~/.coderelay/config.json` and the policy store). A project-controlled `.coderelay/config.json` cannot widen the daemon policy; any future project-level policy must only make it stricter.
+
+The workspace policy is a boundary for CodeRelay decisions, not an OS sandbox. Even trusted workspace execution can access files outside the workspace or the network through scripts and tools. True filesystem and network isolation requires a later OS-level sandbox implementation.
+
 ## Secure transport
 
 The first interactive `coderelay` run can guide you through transport setup. You can also open it explicitly:

@@ -13,7 +13,6 @@ export interface WorkspaceConfig {
   instanceName?: string;
   transport?: TransportPreference | "cloudflare";
   openaiTunnelId?: string;
-  commandPolicy?: { mode?: CommandPolicyMode };
   /** @deprecated Kept so older .coderelay/config.json files can be read. */
   tunnelProvider?: "cloudflared";
 }

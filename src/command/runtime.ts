@@ -8,7 +8,6 @@ import { AuditLogger, type AuditRecord } from "../audit/logger.js";
 import { PolicyEngine, type PolicyEvaluation } from "../policy/engine.js";
 import { PolicyStore } from "../policy/store.js";
 import { runSequential, type ExecutionResult } from "../executor/runner.js";
-import { readWorkspaceConfig } from "../runtime/state.js";
 
 export interface AgentCommandResult {
   status: "success" | "approval_required" | "denied";
@@ -91,8 +90,10 @@ export class AgentCommandRuntime {
       assertNoInlineSecrets(normalized.commands);
       const assessments = normalized.commands.map(analyzeCommand);
       const aggregate = aggregateRisk(assessments);
-      const projectConfig = await readWorkspaceConfig(workspace.root);
-      const mode = projectConfig?.commandPolicy?.mode ?? this.options.mode ?? "safe";
+      // Command policy is intentionally resolved from the daemon-side options,
+      // which come from the user-owned ~/.coderelay configuration. A workspace
+      // must never be able to widen the policy that protects it.
+      const mode = this.options.mode ?? "safe";
       const trusted = await this.policyStore.isTrusted(workspace);
       const fingerprint = commandFingerprint(normalized.commands, workspace.id, normalized.stopOnError, normalized.timeoutMs);
       const approvedOnce = await this.approvals.hasApprovedOnce(fingerprint);

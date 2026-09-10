@@ -45,7 +45,12 @@ export class PolicyEngine {
 
     const requiresApproval = assessments.some((assessment) => {
       if (mode === "safe") return !categoriesAllowed(assessment.categories, SAFE_CATEGORIES);
-      if (mode === "workspace") return trusted ? !categoriesAllowed(assessment.categories, TRUSTED_CATEGORIES) : !categoriesAllowed(assessment.categories, SAFE_CATEGORIES);
+      if (mode === "workspace") {
+        const highRisk = assessment.level === "high" || assessment.level === "critical";
+        return trusted
+          ? highRisk || !categoriesAllowed(assessment.categories, TRUSTED_CATEGORIES)
+          : !categoriesAllowed(assessment.categories, SAFE_CATEGORIES);
+      }
       return false;
     });
     if (requiresApproval) {

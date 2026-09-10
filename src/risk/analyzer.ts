@@ -15,6 +15,18 @@ const INSPECT_PROGRAMS = new Set(["pwd", "ls", "dir", "cat", "head", "tail", "fi
 const EXECUTABLE_PROGRAMS = new Set(["node", "nodejs", "python", "python3", "pytest", "ruby", "php", "perl", "deno", "tsx", "ts-node", "cargo", "go", "make", "gradle", "mvn", "dotnet", "java", "docker"]);
 const NETWORK_PROGRAMS = new Set(["curl", "wget", "ssh", "scp", "sftp", "nc", "ncat", "telnet"]);
 const WRITE_PROGRAMS = new Set(["touch", "mkdir", "cp", "mv", "install", "chmod", "chown", "truncate"]);
+const INLINE_CODE_FLAGS = new Map<string, string[]>([
+  ["node", ["-e", "--eval", "-p", "--print"]],
+  ["nodejs", ["-e", "--eval", "-p", "--print"]],
+  ["python", ["-c"]],
+  ["python3", ["-c"]],
+  ["pypy", ["-c"]],
+  ["pypy3", ["-c"]],
+  ["ruby", ["-e"]],
+  ["perl", ["-e"]],
+  ["php", ["-r"]],
+  ["bun", ["-e", "--eval"]]
+]);
 
 function addCategory(categories: Set<RiskCategory>, category: RiskCategory): void {
   categories.add(category);
@@ -22,6 +34,13 @@ function addCategory(categories: Set<RiskCategory>, category: RiskCategory): voi
 
 function hasAnyArg(args: string[], values: RegExp): boolean {
   return args.some((arg) => values.test(arg.toLowerCase()));
+}
+
+function hasInlineCode(command: StructuredCommand, program: string): boolean {
+  if (program === "deno" && command.args[0]?.toLowerCase() === "eval") return true;
+  const flags = INLINE_CODE_FLAGS.get(program);
+  if (!flags) return false;
+  return command.args.some((argument) => flags.some((flag) => argument === flag || argument.startsWith(`${flag}=`) || (!flag.startsWith("--") && argument.startsWith(flag) && argument.length > flag.length)));
 }
 
 function isRootDestructive(command: StructuredCommand, program: string): boolean {
@@ -86,6 +105,7 @@ export function analyzeCommand(command: StructuredCommand): RiskAssessment {
   const reasons: string[] = [];
   const program = path.basename(command.program).toLowerCase();
   let hardDeny = isRootDestructive(command, program);
+  const inlineCode = hasInlineCode(command, program);
 
   if (["sudo", "su", "doas", "runas"].includes(program)) {
     addCategory(categories, "privileged");
@@ -136,6 +156,11 @@ export function analyzeCommand(command: StructuredCommand): RiskAssessment {
     }
   }
 
+  if (inlineCode) {
+    addCategory(categories, "workspace-exec");
+    reasons.push(`${program} executes inline code supplied in command arguments`);
+  }
+
   if (categories.size === 0) {
     addCategory(categories, "inspect");
     reasons.push("The command only inspects local state");
@@ -144,6 +169,8 @@ export function analyzeCommand(command: StructuredCommand): RiskAssessment {
   const categoryList = [...categories];
   const level: RiskLevel = hardDeny || categoryList.includes("privileged")
     ? "critical"
+    : inlineCode
+      ? "high"
     : categoryList.includes("destructive") || categoryList.includes("external-write")
       ? "high"
       : categoryList.some((category) => ["workspace-write", "workspace-exec", "network"].includes(category))
@@ -166,4 +193,3 @@ export function aggregateRisk(assessments: RiskAssessment[]): RiskAssessment {
     hardDeny: assessments.some((assessment) => assessment.hardDeny)
   };
 }
-

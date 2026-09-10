@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -74,7 +74,8 @@ describe("Agent Command Runtime", () => {
     try {
       const store = new PolicyStore(setup.home);
       const workspaceRuntime = new AgentCommandRuntime({ home: setup.home, mode: "workspace" });
-      const command = { command: { program: "node", args: ["-e", "process.stdout.write('trusted')"] } };
+      await writeFile(path.join(setup.workspace, "trusted.js"), "process.stdout.write('trusted')\n");
+      const command = { command: { program: "node", args: ["trusted.js"] } };
       expect((await workspaceRuntime.run(setup.entry, command)).status).toBe("approval_required");
       await store.trust(setup.entry);
       expect((await workspaceRuntime.run(setup.entry, command)).status).toBe("success");
@@ -96,17 +97,57 @@ describe("Agent Command Runtime", () => {
     }
   });
 
+  it("does not let project config widen policy and treats inline interpreters as high risk", async () => {
+    const setup = await setupWorkspace();
+    try {
+      await mkdir(path.join(setup.workspace, ".coderelay"), { recursive: true });
+      await writeFile(path.join(setup.workspace, ".coderelay", "config.json"), JSON.stringify({ commandPolicy: { mode: "unrestricted" } }));
+      const store = new PolicyStore(setup.home);
+      await store.trust(setup.entry);
+      const inline = { command: { program: "node", args: ["-e", "process.stdout.write('inline')"] } };
+
+      const safeResult = await new AgentCommandRuntime({ home: setup.home, mode: "safe" }).run(setup.entry, inline);
+      expect(safeResult.status).toBe("approval_required");
+      expect(safeResult.risk.level).toBe("high");
+
+      const workspaceResult = await new AgentCommandRuntime({ home: setup.home, mode: "workspace" }).run(setup.entry, inline);
+      expect(workspaceResult.status).toBe("approval_required");
+      expect(workspaceResult.policy.rule).toBe("sensitive-operation");
+
+      for (const command of [
+        { program: "node", args: ["--eval", "1 + 1"] },
+        { program: "python", args: ["-c", "print(1)"] },
+        { program: "ruby", args: ["-e", "puts 1"] },
+        { program: "perl", args: ["-e", "print 1"] }
+      ]) {
+        const risk = analyzeCommand(command);
+        expect(risk.level).toBe("high");
+        expect(risk.categories).toContain("workspace-exec");
+      }
+
+      expect(analyzeCommand({ program: "node", args: ["trusted.js"] }).level).toBe("medium");
+    } finally {
+      await rm(setup.home, { recursive: true, force: true });
+      await rm(setup.workspace, { recursive: true, force: true });
+    }
+  });
+
   it("runs structured sequences, stops on failure, handles timeout, and truncates output", async () => {
     const setup = await setupWorkspace();
     try {
       const runtime = new AgentCommandRuntime({ home: setup.home, mode: "workspace", maxOutputBytes: 128 });
       const store = new PolicyStore(setup.home);
       await store.trust(setup.entry);
+      await writeFile(path.join(setup.workspace, "first.js"), "process.stdout.write('first')\n");
+      await writeFile(path.join(setup.workspace, "fail.js"), "process.exit(3)\n");
+      await writeFile(path.join(setup.workspace, "should-not-run.js"), "process.stdout.write('should-not-run')\n");
+      await writeFile(path.join(setup.workspace, "timeout.js"), "setTimeout(() => {}, 5000)\n");
+      await writeFile(path.join(setup.workspace, "output.js"), "process.stdout.write('x'.repeat(10000))\n");
       const sequence = await runtime.run(setup.entry, {
         commands: [
-          { program: "node", args: ["-e", "process.stdout.write('first')"] },
-          { program: "node", args: ["-e", "process.exit(3)"] },
-          { program: "node", args: ["-e", "process.stdout.write('should-not-run')"] }
+          { program: "node", args: ["first.js"] },
+          { program: "node", args: ["fail.js"] },
+          { program: "node", args: ["should-not-run.js"] }
         ],
         stopOnError: true
       });
@@ -116,14 +157,14 @@ describe("Agent Command Runtime", () => {
       expect(sequence.results?.[1]?.exit_code).toBe(3);
 
       const timeout = await runtime.run(setup.entry, {
-        command: { program: "node", args: ["-e", "setTimeout(() => {}, 5000)"] },
+        command: { program: "node", args: ["timeout.js"] },
         timeoutMs: 1_000
       });
       expect(timeout.status).toBe("success");
       expect(timeout.execution?.timed_out).toBe(true);
 
       const output = await runtime.run(setup.entry, {
-        command: { program: "node", args: ["-e", "process.stdout.write('x'.repeat(10000))"] }
+        command: { program: "node", args: ["output.js"] }
       });
       expect(output.output?.truncated).toBe(true);
       expect(Buffer.byteLength(output.output?.stdout ?? "", "utf8")).toBeLessThanOrEqual(128);
@@ -159,4 +200,3 @@ describe("Agent Command Runtime", () => {
     }
   });
 });
-
