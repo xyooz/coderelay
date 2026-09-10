@@ -225,13 +225,14 @@ describe("CodeRelay workspace-session router", () => {
       const firstBinding = JSON.parse(toolText(await mcpCall(first.session, "tools/call", { name: "use_workspace", arguments: { name: "attendance" } })));
       expect(firstBinding.chat_binding).toBe("attendance");
       expect(firstBinding.instruction).toContain('workspace="attendance"');
-      await mcpCall(second.session, "tools/call", { name: "use_workspace", arguments: { name: "docseek" } });
 
       const explicitCrossSessionRead = await mcpCall(second.session, "tools/call", {
         name: "read_file",
         arguments: { workspace: "attendance", path: "src/project.txt" }
       });
       expect(toolText(explicitCrossSessionRead)).toContain("attendance workspace");
+
+      await mcpCall(second.session, "tools/call", { name: "use_workspace", arguments: { name: "docseek" } });
       const explicitCurrent = JSON.parse(toolText(await mcpCall(second.session, "tools/call", {
         name: "current_workspace",
         arguments: { workspace: "attendance" }
@@ -308,8 +309,17 @@ describe("CodeRelay workspace-session router", () => {
         && event.explicitWorkspace === "attendance"
         && event.resolutionSource === "explicit"
       );
-      expect(explicitTrace.sessionWorkspace).toBe("docseek");
+      expect(explicitTrace.sessionWorkspace).toBeNull();
       expect(explicitTrace.resolvedWorkspace).toBe("attendance");
+
+      const explicitCurrentTrace = await waitForTraceEvent(runtime.serverLog, (event) =>
+        event.toolName === "current_workspace"
+        && event.incomingSessionId === second.session.sessionId
+        && event.explicitWorkspace === "attendance"
+        && event.resolutionSource === "explicit"
+      );
+      expect(explicitCurrentTrace.sessionWorkspace).toBe("docseek");
+      expect(explicitCurrentTrace.resolvedWorkspace).toBe("attendance");
 
       const stop = launchCli(["stop"], coderelayHome);
       expect((await stop.exit).code).toBe(0);

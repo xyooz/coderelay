@@ -200,11 +200,16 @@ class StatefulMcpHandler {
       : sessionWorkspace
         ? "session"
         : "none";
-    const resolvedEntry = requestInfo.explicitWorkspace
-      ? await this.registry.get(requestInfo.explicitWorkspace)
-      : sessionWorkspace
-        ? await this.registry.get(sessionWorkspace)
-        : null;
+    let resolvedEntry = null;
+    try {
+      resolvedEntry = requestInfo.explicitWorkspace
+        ? await this.registry.get(requestInfo.explicitWorkspace)
+        : sessionWorkspace
+          ? await this.registry.get(sessionWorkspace)
+          : null;
+    } catch {
+      // Invalid diagnostic input must never change the MCP response.
+    }
     writeMcpTrace({
       httpMethod: request.method,
       rpcMethod: requestInfo.rpcMethod,
