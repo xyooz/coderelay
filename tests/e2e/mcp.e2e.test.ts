@@ -160,6 +160,14 @@ function toolText(payload: Record<string, any>): string {
   return (result?.content ?? []).map((item: { text?: string }) => item.text ?? "").join("\n");
 }
 
+function toolStructured(payload: Record<string, any>): Record<string, any> {
+  if (payload.error) throw new Error(JSON.stringify(payload.error));
+  const result = payload.result;
+  if (result?.isError) throw new Error(result.content?.[0]?.text ?? "MCP tool failed");
+  expect(result?.structuredContent).toBeDefined();
+  return result.structuredContent as Record<string, any>;
+}
+
 function toolError(payload: Record<string, any>): string {
   const result = payload.result;
   expect(result?.isError).toBe(true);
@@ -215,22 +223,34 @@ describe("CodeRelay workspace-session router", () => {
       expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
         "list_workspaces", "use_workspace", "current_workspace", "list_files", "read_file", "search_code", "write_file", "edit_file", "run_command", "git_diff"
       ]);
+      expect(listed.result.tools.every((tool: { outputSchema?: Record<string, unknown> }) => tool.outputSchema)).toBe(true);
 
       const unbound = await mcpCall(first.session, "tools/call", { name: "read_file", arguments: { path: "src/project.txt" } });
       expect(toolError(unbound)).toContain("use_workspace");
 
-      const workspaces = JSON.parse(toolText(await mcpCall(first.session, "tools/call", { name: "list_workspaces", arguments: {} })));
+      const listedWorkspacesPayload = await mcpCall(first.session, "tools/call", { name: "list_workspaces", arguments: {} });
+      const workspaces = JSON.parse(toolText(listedWorkspacesPayload));
+      const listedWorkspacesStructured = toolStructured(listedWorkspacesPayload);
       expect(workspaces.map((workspace: { name: string }) => workspace.name)).toEqual(["attendance", "docseek"]);
+      expect(listedWorkspacesStructured.workspaces.map((workspace: { name: string }) => workspace.name)).toEqual(["attendance", "docseek"]);
 
-      const firstBinding = JSON.parse(toolText(await mcpCall(first.session, "tools/call", { name: "use_workspace", arguments: { name: "attendance" } })));
+      const firstBindingPayload = await mcpCall(first.session, "tools/call", { name: "use_workspace", arguments: { name: "attendance" } });
+      const firstBinding = JSON.parse(toolText(firstBindingPayload));
+      const firstBindingStructured = toolStructured(firstBindingPayload);
       expect(firstBinding.chat_binding).toBe("attendance");
       expect(firstBinding.instruction).toContain('workspace="attendance"');
+      expect(firstBindingStructured.chat_binding).toBe("attendance");
+      expect(firstBindingStructured.agents.md.content).toContain("attendance tests");
 
       const explicitCrossSessionRead = await mcpCall(second.session, "tools/call", {
         name: "read_file",
         arguments: { workspace: "attendance", path: "src/project.txt" }
       });
       expect(toolText(explicitCrossSessionRead)).toContain("attendance workspace");
+      const explicitCrossSessionReadStructured = toolStructured(explicitCrossSessionRead);
+      expect(explicitCrossSessionReadStructured.path).toBe("src/project.txt");
+      expect(explicitCrossSessionReadStructured.content).toContain("attendance workspace");
+      expect(explicitCrossSessionReadStructured.bytes).toBeGreaterThan(0);
 
       await mcpCall(second.session, "tools/call", { name: "use_workspace", arguments: { name: "docseek" } });
       const explicitCurrent = JSON.parse(toolText(await mcpCall(second.session, "tools/call", {
@@ -256,7 +276,9 @@ describe("CodeRelay workspace-session router", () => {
       expect(current.agents.md.content).toContain("attendance tests");
       expect(current.agents.override_md.content).toContain("attendance fixture");
 
-      expect(toolText(await mcpCall(first.session, "tools/call", { name: "write_file", arguments: { path: "src/only-a.txt", content: "A\n" } }))).toContain("Wrote src/only-a.txt");
+      const writePayload = await mcpCall(first.session, "tools/call", { name: "write_file", arguments: { path: "src/only-a.txt", content: "A\n" } });
+      expect(toolText(writePayload)).toContain("Wrote src/only-a.txt");
+      expect(toolStructured(writePayload)).toMatchObject({ path: "src/only-a.txt", bytes: 2 });
       expect(toolText(await mcpCall(second.session, "tools/call", { name: "write_file", arguments: { path: "src/only-b.txt", content: "B\n" } }))).toContain("Wrote src/only-b.txt");
       await expect(readFile(path.join(firstWorkspace, "src", "only-b.txt"), "utf8")).rejects.toThrow();
       await expect(readFile(path.join(secondWorkspace, "src", "only-a.txt"), "utf8")).rejects.toThrow();

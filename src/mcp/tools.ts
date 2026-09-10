@@ -18,19 +18,85 @@ const MAX_SEARCH_FILE_BYTES = 1_000_000;
 const MAX_OUTPUT_BYTES = 100_000;
 const MAX_LIST_RESULTS = 2_000;
 
+const workspaceSummarySchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  root: z.string(),
+  exists: z.boolean(),
+  agents_md: z.boolean(),
+  agents_override_md: z.boolean()
+});
+
+const workspaceContextSchema = workspaceSummarySchema.extend({
+  chat_binding: z.string(),
+  instruction: z.string(),
+  agents: z.object({
+    md: z.object({ path: z.string(), content: z.string() }).nullable(),
+    override_md: z.object({ path: z.string(), content: z.string() }).nullable()
+  })
+});
+
+const listWorkspacesOutputSchema = z.object({ workspaces: z.array(workspaceSummarySchema) });
+const listFilesOutputSchema = z.object({
+  path: z.string(),
+  files: z.array(z.string()),
+  count: z.number().int()
+});
+const readFileOutputSchema = z.object({
+  path: z.string(),
+  content: z.string(),
+  bytes: z.number().int()
+});
+const searchCodeOutputSchema = z.object({
+  query: z.string(),
+  path: z.string(),
+  matches: z.array(z.string()),
+  count: z.number().int()
+});
+const writeFileOutputSchema = z.object({
+  path: z.string(),
+  bytes: z.number().int(),
+  message: z.string()
+});
+const editFileOutputSchema = z.object({
+  path: z.string(),
+  replacements: z.number().int(),
+  message: z.string()
+});
+const commandOutputSchema = z.object({
+  command: z.string(),
+  exit_code: z.number().int().nullable(),
+  signal: z.string().nullable(),
+  stdout: z.string(),
+  stderr: z.string()
+});
+const gitDiffOutputSchema = z.object({
+  diff: z.string(),
+  path: z.string().nullable(),
+  cached: z.boolean()
+});
+
 export interface ToolContext {
   registry: WorkspaceRegistry;
   sessions: WorkspaceSessionManager;
   sessionId: string;
 }
 
+type StructuredContent = Record<string, unknown>;
+
 type ToolResponse = {
   content: [{ type: "text"; text: string }];
+  structuredContent?: StructuredContent;
   isError?: boolean;
 };
 
-function success(text: string): ToolResponse {
-  return { content: [{ type: "text", text }] };
+interface FormattedToolResult {
+  text: string;
+  structuredContent: StructuredContent;
+}
+
+function success(text: string, structuredContent: StructuredContent): ToolResponse {
+  return { content: [{ type: "text", text }], structuredContent };
 }
 
 function failure(error: unknown): ToolResponse {
@@ -38,9 +104,10 @@ function failure(error: unknown): ToolResponse {
   return { content: [{ type: "text", text: message }], isError: true };
 }
 
-async function guarded<T>(operation: () => Promise<T>, format: (value: T) => string): Promise<ToolResponse> {
+async function guarded<T>(operation: () => Promise<T>, format: (value: T) => FormattedToolResult): Promise<ToolResponse> {
   try {
-    return success(format(await operation()));
+    const result = format(await operation());
+    return success(result.text, result.structuredContent);
   } catch (error) {
     return failure(error);
   }
@@ -174,11 +241,13 @@ async function searchCode(
   return matches;
 }
 
-async function writeFile(workspaceRoot: string, requestedPath: string, content: string): Promise<string> {
+async function writeFile(workspaceRoot: string, requestedPath: string, content: string): Promise<{ path: string; bytes: number; message: string }> {
   const absolutePath = await resolveWorkspacePath(workspaceRoot, requestedPath);
   await fs.mkdir(path.dirname(absolutePath), { recursive: true });
   await fs.writeFile(absolutePath, content, "utf8");
-  return `Wrote ${toWorkspaceRelativePath(workspaceRoot, absolutePath)} (${Buffer.byteLength(content, "utf8")} bytes).`;
+  const relativePath = toWorkspaceRelativePath(workspaceRoot, absolutePath);
+  const bytes = Buffer.byteLength(content, "utf8");
+  return { path: relativePath, bytes, message: `Wrote ${relativePath} (${bytes} bytes).` };
 }
 
 async function editFile(
@@ -187,7 +256,7 @@ async function editFile(
   oldText: string,
   newText: string,
   replaceAll: boolean
-): Promise<string> {
+): Promise<{ path: string; replacements: number; message: string }> {
   if (!oldText) throw new Error("old_text must not be empty.");
   const absolutePath = await resolveWorkspacePath(workspaceRoot, requestedPath, { mustExist: true });
   const content = await fs.readFile(absolutePath, "utf8");
@@ -198,7 +267,9 @@ async function editFile(
   }
   const next = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, newText);
   await fs.writeFile(absolutePath, next, "utf8");
-  return `Edited ${toWorkspaceRelativePath(workspaceRoot, absolutePath)} (${replaceAll ? occurrences : 1} replacement).`;
+  const relativePath = toWorkspaceRelativePath(workspaceRoot, absolutePath);
+  const replacements = replaceAll ? occurrences : 1;
+  return { path: relativePath, replacements, message: `Edited ${relativePath} (${replacements} replacement).` };
 }
 
 function appendOutput(current: string, chunk: Buffer): string {
@@ -269,7 +340,11 @@ function workspaceSummary(descriptor: WorkspaceDescriptor): Record<string, unkno
 }
 
 function formatCurrentWorkspace(descriptor: WorkspaceDescriptor): string {
-  return JSON.stringify({
+  return JSON.stringify(currentWorkspaceData(descriptor), null, 2);
+}
+
+function currentWorkspaceData(descriptor: WorkspaceDescriptor): StructuredContent {
+  return {
     ...workspaceSummary(descriptor),
     chat_binding: descriptor.name,
     instruction: `Use workspace="${descriptor.name}" as the default for this logical task context. To work in another registered workspace, pass workspace explicitly on that call; each call remains isolated.`,
@@ -277,7 +352,7 @@ function formatCurrentWorkspace(descriptor: WorkspaceDescriptor): string {
       md: descriptor.agents.md,
       override_md: descriptor.agents.overrideMd
     }
-  }, null, 2);
+  };
 }
 
 async function currentWorkspaceDescriptor(context: ToolContext, explicitWorkspace?: string): Promise<WorkspaceDescriptor> {
@@ -291,108 +366,171 @@ export function createMcpServer(context: ToolContext): McpServer {
     "list_workspaces",
     {
       description: "List the workspaces registered with this CodeRelay daemon. This does not change the current MCP session binding.",
-      inputSchema: z.object({})
+      inputSchema: z.object({}),
+      outputSchema: listWorkspacesOutputSchema
     },
-    async () => guarded(async () => JSON.stringify((await context.registry.describeAll()).map(workspaceSummary), null, 2), (value) => value)
+    async () => guarded(
+      async () => await context.registry.describeAll(),
+      (descriptors) => {
+        const workspaces = descriptors.map(workspaceSummary);
+        return { text: JSON.stringify(workspaces, null, 2), structuredContent: { workspaces } };
+      }
+    )
   );
 
   server.registerTool(
     "use_workspace",
     {
       description: "Select one registered workspace as the default for this logical task context and cache it for stable MCP sessions. Pass the workspace name or id returned by list_workspaces; arbitrary paths are not accepted. Later calls may pass another registered workspace explicitly when the user requests cross-project work.",
-      inputSchema: z.object({ name: z.string().min(1) })
+      inputSchema: z.object({ name: z.string().min(1) }),
+      outputSchema: workspaceContextSchema
     },
     async ({ name }) => guarded(async () => {
       const workspace = await context.registry.requireUsable(name);
       context.sessions.bind(context.sessionId, workspace);
-      return formatCurrentWorkspace(await context.registry.describe(workspace));
-    }, (value) => value)
+      return await context.registry.describe(workspace);
+    }, (descriptor) => ({ text: formatCurrentWorkspace(descriptor), structuredContent: currentWorkspaceData(descriptor) }))
   );
 
   server.registerTool(
     "current_workspace",
     {
       description: "Show workspace context, including read-only AGENTS.md context. Pass workspace explicitly when the MCP transport session may have changed; otherwise the session cache is used.",
-      inputSchema: z.object({ workspace: z.string().min(1).optional() })
+      inputSchema: z.object({ workspace: z.string().min(1).optional() }),
+      outputSchema: workspaceContextSchema
     },
-    async ({ workspace }) => guarded(async () => formatCurrentWorkspace(await currentWorkspaceDescriptor(context, workspace)), (value) => value)
+    async ({ workspace }) => guarded(
+      async () => await currentWorkspaceDescriptor(context, workspace),
+      (descriptor) => ({ text: formatCurrentWorkspace(descriptor), structuredContent: currentWorkspaceData(descriptor) })
+    )
   );
 
   server.registerTool(
     "list_files",
     {
       description: scopedDescription("List files and directories inside the selected CodeRelay workspace."),
-      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string().default("."), depth: z.number().int().min(0).max(20).default(3), include_hidden: z.boolean().default(false) })
+      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string().default("."), depth: z.number().int().min(0).max(20).default(3), include_hidden: z.boolean().default(false) }),
+      outputSchema: listFilesOutputSchema
     },
-    async ({ workspace, path: requestedPath, depth, include_hidden }) => guarded(async () => listFiles((await requireWorkspace(context, workspace)).root, requestedPath, depth, include_hidden), (files) => files.length ? files.join("\n") : "(empty)")
+    async ({ workspace, path: requestedPath, depth, include_hidden }) => guarded(
+      async () => await listFiles((await requireWorkspace(context, workspace)).root, requestedPath, depth, include_hidden),
+      (files) => ({
+        text: files.length ? files.join("\n") : "(empty)",
+        structuredContent: { path: requestedPath, files, count: files.length }
+      })
+    )
   );
 
   server.registerTool(
     "read_file",
     {
       description: scopedDescription("Read a UTF-8 text file inside the selected workspace. Sensitive files are blocked."),
-      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string(), max_bytes: z.number().int().min(1).max(MAX_FILE_BYTES).default(MAX_FILE_BYTES) })
+      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string(), max_bytes: z.number().int().min(1).max(MAX_FILE_BYTES).default(MAX_FILE_BYTES) }),
+      outputSchema: readFileOutputSchema
     },
-    async ({ workspace, path: requestedPath, max_bytes }) => guarded(async () => readFile((await requireWorkspace(context, workspace)).root, requestedPath, max_bytes), (content) => content)
+    async ({ workspace, path: requestedPath, max_bytes }) => guarded(
+      async () => {
+        const workspaceRoot = (await requireWorkspace(context, workspace)).root;
+        const absolutePath = await resolveWorkspacePath(workspaceRoot, requestedPath, { mustExist: true });
+        return { path: toWorkspaceRelativePath(workspaceRoot, absolutePath), content: await readFile(workspaceRoot, requestedPath, max_bytes) };
+      },
+      (result) => ({
+        text: result.content,
+        structuredContent: { path: result.path, content: result.content, bytes: Buffer.byteLength(result.content, "utf8") }
+      })
+    )
   );
 
   server.registerTool(
     "search_code",
     {
       description: scopedDescription("Search text in files inside the selected workspace without reading blocked sensitive files."),
-      inputSchema: z.object({ workspace: z.string().min(1).optional(), query: z.string(), path: z.string().default("."), max_results: z.number().int().min(1).max(200).default(50), case_sensitive: z.boolean().default(false) })
+      inputSchema: z.object({ workspace: z.string().min(1).optional(), query: z.string(), path: z.string().default("."), max_results: z.number().int().min(1).max(200).default(50), case_sensitive: z.boolean().default(false) }),
+      outputSchema: searchCodeOutputSchema
     },
-    async ({ workspace, query, path: requestedPath, max_results, case_sensitive }) => guarded(async () => searchCode((await requireWorkspace(context, workspace)).root, query, requestedPath, max_results, case_sensitive), (matches) => matches.length ? matches.join("\n") : "No matches.")
+    async ({ workspace, query, path: requestedPath, max_results, case_sensitive }) => guarded(
+      async () => await searchCode((await requireWorkspace(context, workspace)).root, query, requestedPath, max_results, case_sensitive),
+      (matches) => ({
+        text: matches.length ? matches.join("\n") : "No matches.",
+        structuredContent: { query, path: requestedPath, matches, count: matches.length }
+      })
+    )
   );
 
   server.registerTool(
     "write_file",
     {
       description: scopedDescription("Create or replace a UTF-8 text file inside the selected workspace."),
-      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string(), content: z.string() })
+      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string(), content: z.string() }),
+      outputSchema: writeFileOutputSchema
     },
-    async ({ workspace, path: requestedPath, content }) => guarded(async () => writeFile((await requireWorkspace(context, workspace)).root, requestedPath, content), (message) => message)
+    async ({ workspace, path: requestedPath, content }) => guarded(
+      async () => await writeFile((await requireWorkspace(context, workspace)).root, requestedPath, content),
+      (result) => ({ text: result.message, structuredContent: result })
+    )
   );
 
   server.registerTool(
     "edit_file",
     {
       description: scopedDescription("Replace an exact text fragment in a file inside the selected workspace."),
-      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string(), old_text: z.string(), new_text: z.string(), replace_all: z.boolean().default(false) })
+      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string(), old_text: z.string(), new_text: z.string(), replace_all: z.boolean().default(false) }),
+      outputSchema: editFileOutputSchema
     },
-    async ({ workspace, path: requestedPath, old_text, new_text, replace_all }) => guarded(async () => editFile((await requireWorkspace(context, workspace)).root, requestedPath, old_text, new_text, replace_all), (message) => message)
+    async ({ workspace, path: requestedPath, old_text, new_text, replace_all }) => guarded(
+      async () => await editFile((await requireWorkspace(context, workspace)).root, requestedPath, old_text, new_text, replace_all),
+      (result) => ({ text: result.message, structuredContent: result })
+    )
   );
 
   server.registerTool(
     "run_command",
     {
       description: scopedDescription("Run a shell-free command from the selected workspace. Dangerous commands and workspace escapes are blocked."),
-      inputSchema: z.object({ workspace: z.string().min(1).optional(), command: z.string(), timeout_ms: z.number().int().min(1_000).max(120_000).default(120_000) })
+      inputSchema: z.object({ workspace: z.string().min(1).optional(), command: z.string(), timeout_ms: z.number().int().min(1_000).max(120_000).default(120_000) }),
+      outputSchema: commandOutputSchema
     },
     async ({ workspace, command, timeout_ms }) => guarded(async () => {
       const workspaceRoot = (await requireWorkspace(context, workspace)).root;
       const parsed = validateCommand(command, workspaceRoot);
-      return formatCommandResult(command, await executeCommand(workspaceRoot, parsed, timeout_ms));
-    }, (message) => message)
+      return { command, result: await executeCommand(workspaceRoot, parsed, timeout_ms) };
+    }, ({ command: executedCommand, result }) => ({
+      text: formatCommandResult(executedCommand, result),
+      structuredContent: {
+        command: executedCommand,
+        exit_code: result.exitCode,
+        signal: result.signal,
+        stdout: result.stdout,
+        stderr: result.stderr
+      }
+    }))
   );
 
   server.registerTool(
     "git_diff",
     {
       description: scopedDescription("Show the current Git diff for the selected workspace."),
-      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string().optional(), cached: z.boolean().default(false) })
+      inputSchema: z.object({ workspace: z.string().min(1).optional(), path: z.string().optional(), cached: z.boolean().default(false) }),
+      outputSchema: gitDiffOutputSchema
     },
     async ({ workspace, path: requestedPath, cached }) => guarded(async () => {
       const workspaceRoot = (await requireWorkspace(context, workspace)).root;
       const args = ["diff"];
+      let relativePath: string | null = null;
       if (cached) args.push("--cached");
       if (requestedPath) {
         const absolutePath = await resolveWorkspacePath(workspaceRoot, requestedPath, { mustExist: true, allowDirectory: true });
-        args.push("--", toWorkspaceRelativePath(workspaceRoot, absolutePath));
+        relativePath = toWorkspaceRelativePath(workspaceRoot, absolutePath);
+        args.push("--", relativePath);
       }
       const parsed: ParsedCommand = { executable: "git", args };
-      return formatCommandResult(`git ${args.join(" ")}`, await executeCommand(workspaceRoot, parsed));
-    }, (message) => message)
+      const command = `git ${args.join(" ")}`;
+      const result = await executeCommand(workspaceRoot, parsed);
+      return { command, relativePath, cached, result };
+    }, ({ command, relativePath, cached, result }) => ({
+      text: formatCommandResult(command, result),
+      structuredContent: { diff: result.stdout, path: relativePath, cached }
+    }))
   );
 
   return server;
