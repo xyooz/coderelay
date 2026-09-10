@@ -3,15 +3,19 @@ import {
   addWorkspaceCommand,
   configShowCommand,
   doctorCommand,
+  endpointCommand,
   listCommand,
   removeWorkspaceCommand,
   restartCommand,
+  rotateEndpointCommand,
   serveCommand,
   startCommand,
   statusCommand,
   stopCommand,
   workspacesCommand
 } from "./cli/commands.js";
+import { authLogoutCommand, authOpenAiCommand, authStatusCommand, configTransportCommand, setupCommand } from "./cli/setup.js";
+import type { TransportPreference } from "./runtime/state.js";
 
 const program = new Command();
 program
@@ -26,10 +30,22 @@ program
   .option("--workspace <path>", "workspace directory (legacy alias)")
   .option("--name <name>", "instance name")
   .option("--tunnel-id <id>", "OpenAI Secure MCP Tunnel ID")
-  .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare"]))
+  .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare-named", "cloudflare-quick", "cloudflare", "local"]))
   .option("--port <number>", "preferred local port", (value) => Number.parseInt(value, 10))
   .option("--no-tunnel", "start locally without a public tunnel")
-  .action(async (workspace: string | undefined, options: { workspace?: string; name?: string; tunnelId?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => startCommand({ ...options, workspace: options.workspace ?? workspace }));
+  .action(async (workspace: string | undefined, options: { workspace?: string; name?: string; tunnelId?: string; transport?: TransportPreference | "cloudflare"; port?: number; tunnel?: boolean }) => startCommand({ ...options, workspace: options.workspace ?? workspace }));
+
+program
+  .command("setup")
+  .description("Choose and save a transport configuration")
+  .action(setupCommand);
+
+const auth = program
+  .command("auth")
+  .description("Manage OpenAI Secure MCP Tunnel credentials");
+auth.command("openai").description("Save an OpenAI API key locally").action(authOpenAiCommand);
+auth.command("status").description("Show OpenAI credential status without revealing the key").action(authStatusCommand);
+auth.command("logout").description("Remove the locally stored OpenAI API key").action(authLogoutCommand);
 
 program
   .command("serve", { hidden: true })
@@ -37,8 +53,11 @@ program
   .requiredOption("--instance-name <name>", "instance name")
   .requiredOption("--host <host>", "bind host")
   .requiredOption("--port <number>", "local port", (value) => Number.parseInt(value, 10))
-  .requiredOption("--token <token>", "endpoint token")
-  .action(async (options: { registryHome: string; instanceName: string; host: string; port: number; token: string }) => serveCommand(options));
+  .option("--token <token>", "endpoint token (legacy; normally passed through the environment)")
+  .action(async (options: { registryHome: string; instanceName: string; host: string; port: number; token?: string }) => serveCommand({
+    ...options,
+    token: options.token ?? process.env.CODERELAY_MCP_ENDPOINT_TOKEN ?? ""
+  }));
 
 program
   .command("add")
@@ -80,6 +99,15 @@ program
   .description("Diagnose local setup and connectivity")
   .action(async () => doctorCommand());
 
+const endpoint = program
+  .command("endpoint")
+  .description("Show the active MCP endpoint");
+endpoint.action(endpointCommand);
+endpoint
+  .command("rotate")
+  .description("Rotate the MCP endpoint token and invalidate the previous endpoint")
+  .action(rotateEndpointCommand);
+
 program
   .command("restart")
   .description("Restart CodeRelay")
@@ -87,19 +115,21 @@ program
   .option("--workspace <path>", "optionally register this workspace")
   .option("--name <name>", "instance name override")
   .option("--tunnel-id <id>", "OpenAI Secure MCP Tunnel ID for this workspace")
-  .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare"]))
+  .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare-named", "cloudflare-quick", "cloudflare", "local"]))
   .option("--port <number>", "preferred local port", (value) => Number.parseInt(value, 10))
   .option("--no-tunnel", "restart locally without a public tunnel")
-  .action(async (_name: string | undefined, options: { workspace?: string; name?: string; tunnelId?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => restartCommand(options));
+  .action(async (_name: string | undefined, options: { workspace?: string; name?: string; tunnelId?: string; transport?: TransportPreference | "cloudflare"; port?: number; tunnel?: boolean }) => restartCommand(options));
 
-program
+const config = program
   .command("config")
-  .description("Inspect daemon configuration")
-  .command("show")
-  .action(async () => configShowCommand());
+  .description("Inspect and update daemon configuration");
+config.command("show").action(async () => configShowCommand());
+config.command("transport")
+  .argument("<transport>", "auto, openai, cloudflare-named, cloudflare-quick, or local")
+  .action(async (transport: string) => configTransportCommand(transport as TransportPreference));
 
 const args = process.argv.slice(2);
-const commands = new Set(["start", "serve", "add", "remove", "workspaces", "stop", "status", "list", "doctor", "restart", "config"]);
+const commands = new Set(["start", "setup", "serve", "auth", "add", "remove", "workspaces", "stop", "status", "list", "doctor", "endpoint", "restart", "config"]);
 if (args.length === 0) args.push("start");
 else if (!commands.has(args[0]) && !["--help", "-h", "--version", "-V"].includes(args[0])) args.unshift("start");
 

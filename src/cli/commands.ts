@@ -4,20 +4,33 @@ import { detectWorkspace } from "../workspace/detect.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { runMcpServer } from "../mcp/server.js";
 import { CloudflaredTunnelProvider } from "../tunnel/cloudflared.js";
+import { CloudflareNamedTunnelProvider } from "../tunnel/cloudflare-named.js";
 import { OpenAiTunnelProvider, resolveTunnelClient } from "../tunnel/openai.js";
 import { selectTransport, type TransportPreference } from "../tunnel/selection.js";
 import { waitForHealth, type HealthProbe } from "../tunnel/readiness.js";
 import type { TunnelProcess, TunnelProvider, TunnelStartContext } from "../tunnel/provider.js";
 import {
+  CLOUDFLARE_REMOTE_TUNNEL_DOCS,
+  CLOUDFLARE_TUNNEL_DOCS,
+  OPENAI_TUNNEL_DOCS,
+  OPENAI_TUNNEL_SETTINGS,
+  setupCommand
+} from "./setup.js";
+import {
   CODERELAY_HOME,
   DAEMON_LOG_PATH,
   defaultInstanceName,
   ensureDaemonStateDirectories,
+  getOrCreateMcpEndpointToken,
   isProcessAlive,
+  readCloudflareTunnelTokenSync,
   readDaemonConfig,
   readDaemonRuntimeState,
+  readOpenAiApiKeySync,
+  rotateMcpEndpointToken,
+  resolveConfiguredOpenAiTunnelId,
+  resolveTransportConfig,
   removeDaemonRuntimeState,
-  writeDaemonConfig,
   writeDaemonRuntimeState,
   type DaemonConfig,
   type RuntimeState,
@@ -27,7 +40,6 @@ import {
   commandExists,
   currentEntryPoint,
   findAvailablePort,
-  randomToken,
   spawnDetachedProcess,
   terminateProcess,
   waitForHttp
@@ -40,7 +52,7 @@ export interface StartOptions {
   name?: string;
   tunnelId?: string;
   port?: number;
-  transport?: TransportPreference;
+  transport?: TransportPreference | "cloudflare";
   tunnel?: boolean;
 }
 
@@ -68,15 +80,15 @@ function serverChildCommand(args: string[]): { command: string; args: string[] }
 }
 
 function configuredTransport(config: DaemonConfig | null): TransportPreference {
-  return config?.transport ?? "auto";
+  return resolveTransportConfig(config).preferred;
 }
 
 export function resolveOpenAiTunnelId(
   explicitTunnelId: string | undefined,
-  config: Pick<DaemonConfig, "openaiTunnelId"> | null,
+  config: Pick<DaemonConfig, "openai" | "openaiTunnelId"> | null,
   environmentTunnelId = process.env.CONTROL_PLANE_TUNNEL_ID
 ): string | undefined {
-  return explicitTunnelId ?? config?.openaiTunnelId ?? environmentTunnelId;
+  return explicitTunnelId ?? resolveConfiguredOpenAiTunnelId(config) ?? environmentTunnelId;
 }
 
 async function logTransportEvent(logPath: string, message: string): Promise<void> {
@@ -100,12 +112,18 @@ async function waitForTransport(provider: TunnelProvider, tunnel: TunnelProcess,
 
 function providerFor(name: TransportProviderName): TunnelProvider {
   if (name === "openai") return new OpenAiTunnelProvider(() => DAEMON_LOG_PATH);
+  if (name === "cloudflare-named") return new CloudflareNamedTunnelProvider(() => DAEMON_LOG_PATH);
   return new CloudflaredTunnelProvider(() => DAEMON_LOG_PATH);
+}
+
+function providerNameForPreference(preference: TransportPreference): RuntimeState["transportProvider"] {
+  if (preference === "openai" || preference === "cloudflare-named" || preference === "cloudflare-quick") return preference;
+  return "disabled";
 }
 
 function processFromState(state: RuntimeState): TunnelProcess {
   return {
-    provider: state.transportProvider === "openai" ? "openai" : "cloudflare",
+    provider: state.transportProvider === "disabled" ? "local" : state.transportProvider,
     pid: state.transportPid,
     baseUrl: state.transportBaseUrl,
     healthUrl: state.transportHealthUrl,
@@ -122,7 +140,7 @@ function currentTransportState(state: RuntimeState): NonNullable<RuntimeState["t
 }
 
 async function refreshTransportState(state: RuntimeState, processAlive: boolean, transportHealthy: boolean): Promise<NonNullable<RuntimeState["transportState"]>> {
-  const nextState = state.transportProvider === "disabled"
+  const nextState = state.transportProvider === "disabled" || state.transportProvider === "local"
     ? "disabled"
     : processAlive && transportHealthy
       ? "ready"
@@ -163,13 +181,19 @@ function printReadyMessage(state: RuntimeState, workspaceCount: number): void {
     console.log("ChatGPT app: CodeRelay");
     console.log("In ChatGPT, call list_workspaces and then use_workspace for this chat.");
     console.log("Keep this process running while using the ChatGPT app.");
-  } else if (state.transportProvider === "cloudflare") {
+  } else if (state.transportProvider === "cloudflare-quick" || state.transportProvider === "cloudflare-named") {
     console.log(state.transportState === "degraded" ? "Local MCP is ready; the public endpoint is still warming up." : "Secure connection ready");
-    console.log(state.endpoint);
+    console.log(`Transport: ${state.transportProvider === "cloudflare-named" ? "Cloudflare Named Tunnel" : "Cloudflare Quick Tunnel"}`);
+    if (state.transportProvider === "cloudflare-named") {
+      const hostname = state.publicBaseUrl ? new URL(state.publicBaseUrl).hostname : "not available";
+      console.log(`Public hostname: ${hostname}`);
+    }
+    console.log(`Public MCP endpoint: ${state.mcpEndpoint ?? state.endpoint}`);
     console.log("\nChatGPT:");
     console.log("Settings → Apps / Connectors → create or select CodeRelay");
     console.log("Use the endpoint above when ChatGPT asks for the MCP server URL.");
   } else {
+    console.log("Transport: Local only");
     console.log("Local MCP server ready");
     console.log(state.endpoint);
     console.log("\nTunnel disabled; this endpoint is local-only.");
@@ -197,24 +221,25 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
     console.log(`  ✓ Workspace registered: ${entry.name}`);
   }
 
-  const previousConfig = await readDaemonConfig();
+  let previousConfig = await readDaemonConfig();
+  if (!options.transport && options.tunnel !== false && !previousConfig?.transport && process.stdin.isTTY && process.stdout.isTTY) {
+    await setupCommand();
+    previousConfig = await readDaemonConfig();
+  }
+
   const host = previousConfig?.host ?? "127.0.0.1";
   const preferredPort = options.port ?? previousConfig?.port ?? 7676;
   const port = await findAvailablePort(preferredPort, host);
-  const useTunnel = options.tunnel !== false;
-  const preference = options.transport ?? configuredTransport(previousConfig);
+  const configured = resolveTransportConfig(previousConfig);
+  const preference: TransportPreference = options.transport === "cloudflare" ? "cloudflare-quick" : options.transport ?? configured.preferred;
+  const fallbackPreference = configured.fallback;
+  const useTunnel = options.tunnel !== false && preference !== "local";
   const openaiTunnelId = resolveOpenAiTunnelId(options.tunnelId, previousConfig);
-  if (options.transport || options.tunnelId) {
-    await writeDaemonConfig({
-      ...previousConfig,
-      ...(options.transport ? { transport: options.transport } : {}),
-      ...(options.tunnelId ? { openaiTunnelId: options.tunnelId } : {})
-    });
-  }
 
+  // CLI transport and tunnel-id flags intentionally affect only this run.
   await ensureDaemonIsStopped();
   await ensureDaemonStateDirectories();
-  const token = randomToken();
+  const token = await getOrCreateMcpEndpointToken();
   const timestamp = new Date().toISOString().replace(/[:.]/gu, "-");
   const serverLog = path.join(DAEMON_LOG_PATH, `server-${timestamp}.log`);
   const serverCommand = serverChildCommand([
@@ -222,26 +247,35 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
     "--registry-home", CODERELAY_HOME,
     "--instance-name", DAEMON_NAME,
     "--host", host,
-    "--port", String(port),
-    "--token", token
+    "--port", String(port)
   ]);
-  const serverProcess = spawnDetachedProcess(serverCommand.command, serverCommand.args, serverLog, CODERELAY_HOME);
+  const serverProcess = spawnDetachedProcess(
+    serverCommand.command,
+    serverCommand.args,
+    serverLog,
+    CODERELAY_HOME,
+    { ...process.env, CODERELAY_MCP_ENDPOINT_TOKEN: token }
+  );
   const serverPid = serverProcess.pid;
   if (!serverPid) throw new Error("Could not start the local MCP daemon.");
 
   const localBase = localBaseUrl(host, port);
   const localEndpoint = endpointFor(localBase, token);
+  const localOnly = !useTunnel;
   const state: RuntimeState = {
     instanceName: DAEMON_NAME,
     pid: serverPid,
     transportPid: 0,
-    transportState: useTunnel ? "starting" : "disabled",
+    transportState: localOnly ? "disabled" : "starting",
     workspace: "<multiple registered workspaces>",
     host,
     port,
     token,
-    transportProvider: "disabled",
+    transportProvider: localOnly ? (preference === "local" ? "local" : "disabled") : "disabled",
+    transportPreference: preference,
     openaiTunnelId,
+    publicBaseUrl: undefined,
+    mcpEndpoint: localEndpoint,
     endpoint: localEndpoint,
     startedAt: new Date().toISOString(),
     serverLog,
@@ -262,29 +296,42 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
         localEndpoint,
         workspace: CODERELAY_HOME,
         instanceName: DAEMON_NAME,
-        openaiTunnelId
+        openaiTunnelId,
+        cloudflareManagement: previousConfig?.cloudflare?.management,
+        cloudflareTunnelToken: readCloudflareTunnelTokenSync().value,
+        cloudflareTunnel: previousConfig?.cloudflare?.tunnel,
+        cloudflareHostname: previousConfig?.cloudflare?.hostname,
+        cloudflareConfigPath: previousConfig?.cloudflare?.configPath,
+        cloudflareCredentialsFile: previousConfig?.cloudflare?.credentialsFile
       };
-      let selected: TunnelProvider;
-      try {
-        selected = await selectTransport(preference, context);
-      } catch (error) {
-        state.transportState = "degraded";
-        await writeDaemonRuntimeState(state);
-        console.log(`  ! Secure transport is unavailable: ${error instanceof Error ? error.message : String(error)}`);
-        printReadyMessage(state, entries.length);
-        return;
-      }
-      // Recreate the selected provider with daemon-scoped logs. The selection
-      // helper only answers availability; process ownership belongs here.
-      selected = providerFor(selected.name);
-      const candidates: TunnelProvider[] = [selected];
-      if (preference === "auto" && selected.name === "openai") candidates.push(new CloudflaredTunnelProvider(() => DAEMON_LOG_PATH));
+      const candidatePreferences: TransportPreference[] = [preference];
+      if (fallbackPreference && fallbackPreference !== preference && fallbackPreference !== "local") candidatePreferences.push(fallbackPreference);
+      let fallbackReason: string | undefined;
 
-      for (const [candidateIndex, provider] of candidates.entries()) {
+      for (const [candidateIndex, candidatePreference] of candidatePreferences.entries()) {
+        let provider: TunnelProvider;
+        try {
+          provider = providerFor((await selectTransport(candidatePreference, context)).name);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          fallbackReason = reason;
+          state.transportProvider = providerNameForPreference(candidatePreference);
+          console.log(`  ! ${candidatePreference} transport unavailable: ${reason}`);
+          if (candidateIndex < candidatePreferences.length - 1) {
+            console.log(`  ! Falling back to ${candidatePreferences[candidateIndex + 1]}.`);
+            continue;
+          }
+          state.transportState = "degraded";
+          state.transportFallbackReason = reason;
+          await writeDaemonRuntimeState(state);
+          continue;
+        }
+
         state.transportProvider = provider.name;
         state.transportState = "starting";
+        state.transportFallbackReason = fallbackReason;
         await writeDaemonRuntimeState(state);
-        const maxRetries = provider.name === "cloudflare" ? 1 : 0;
+        const maxRetries = provider.name === "cloudflare-quick" ? 1 : 0;
         let ready = false;
 
         for (let retryNumber = 0; retryNumber <= maxRetries; retryNumber += 1) {
@@ -295,7 +342,9 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
             state.transportBaseUrl = transportProcess.baseUrl;
             state.transportHealthUrl = transportProcess.healthUrl;
             state.openaiTunnelId = transportProcess.tunnelId ?? state.openaiTunnelId;
-            state.endpoint = transportProcess.baseUrl ? endpointFor(transportProcess.baseUrl, token) : `openai://tunnel/${state.openaiTunnelId ?? "unknown"}`;
+            state.publicBaseUrl = transportProcess.baseUrl;
+            state.mcpEndpoint = transportProcess.baseUrl ? endpointFor(transportProcess.baseUrl, token) : `openai://tunnel/${state.openaiTunnelId ?? "unknown"}`;
+            state.endpoint = state.mcpEndpoint;
             state.transportLog = transportProcess.logPath;
             await writeDaemonRuntimeState(state);
 
@@ -314,7 +363,7 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
               state.transportPid = 0;
               state.transportState = "degraded";
               await writeDaemonRuntimeState(state);
-              console.log("  ! Secure endpoint is still warming up; retrying the Cloudflare tunnel once.");
+              console.log("  ! Secure endpoint is still warming up; retrying the Cloudflare Quick Tunnel once.");
             }
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -323,22 +372,25 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
             transportProcess = undefined;
             state.transportPid = 0;
             state.transportState = "degraded";
+            state.transportFallbackReason = message;
             await writeDaemonRuntimeState(state);
             console.log(`  ! ${provider.name} transport did not start: ${message}`);
+            fallbackReason = message;
             break;
           }
         }
 
         if (ready) break;
-        if (candidateIndex < candidates.length - 1) {
+        if (candidateIndex < candidatePreferences.length - 1) {
           if (transportProcess) {
             await logTransportEvent(transportProcess.logPath, `stopping unavailable ${provider.name} transport before fallback`);
             await provider.stop(transportProcess).catch(() => undefined);
             transportProcess = undefined;
           }
-          console.log("  ! OpenAI Secure MCP Tunnel is unavailable; falling back to Cloudflare Quick Tunnel.");
+          console.log(`  ! ${provider.name} is unavailable; falling back to ${candidatePreferences[candidateIndex + 1]}.`);
           state.transportPid = 0;
           state.transportState = "starting";
+          state.transportFallbackReason = fallbackReason;
           await writeDaemonRuntimeState(state);
           continue;
         }
@@ -351,7 +403,7 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
 
     state.transportPid = transportProcess?.pid ?? state.transportPid;
     state.transportLog = transportProcess?.logPath ?? state.transportLog;
-    if (!useTunnel) state.transportProvider = "disabled";
+    if (!useTunnel && preference !== "local") state.transportProvider = "disabled";
     await writeDaemonRuntimeState(state);
     printReadyMessage(state, entries.length);
   } catch (error) {
@@ -363,6 +415,7 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
 }
 
 export async function serveCommand(options: ServeOptions): Promise<void> {
+  if (!options.token) throw new Error("MCP endpoint token is missing.");
   await runMcpServer({
     registryHome: options.registryHome ?? CODERELAY_HOME,
     instanceName: options.instanceName,
@@ -382,7 +435,9 @@ async function health(url: string): Promise<boolean> {
 }
 
 function transportProcessLabel(provider: RuntimeState["transportProvider"]): string {
-  return provider === "openai" ? "tunnel-client" : "cloudflared";
+  if (provider === "openai") return "tunnel-client";
+  if (provider === "local" || provider === "disabled") return "transport";
+  return "cloudflared";
 }
 
 export async function stopCommand(): Promise<void> {
@@ -391,38 +446,96 @@ export async function stopCommand(): Promise<void> {
     console.log("CodeRelay daemon is not running.");
     return;
   }
-  if (state.transportPid && state.transportProvider !== "disabled") await providerFor(state.transportProvider).stop(processFromState(state));
+  if (state.transportPid && state.transportProvider !== "disabled" && state.transportProvider !== "local") await providerFor(state.transportProvider).stop(processFromState(state));
   await terminateProcess(state.pid);
   await removeDaemonRuntimeState();
   console.log("Stopped CodeRelay daemon.");
+}
+
+export async function endpointCommand(): Promise<void> {
+  const state = await readDaemonRuntimeState();
+  if (!state || !isProcessAlive(state.pid)) {
+    console.log("CodeRelay daemon is not running; no active MCP endpoint.");
+    return;
+  }
+  console.log(`MCP endpoint: ${state.mcpEndpoint ?? state.endpoint}`);
+}
+
+export async function rotateEndpointCommand(): Promise<void> {
+  const previous = await readDaemonRuntimeState();
+  const wasRunning = Boolean(previous && isProcessAlive(previous.pid));
+  if (wasRunning) await stopCommand();
+
+  await rotateMcpEndpointToken();
+  if (!wasRunning) {
+    console.log("MCP endpoint token rotated. Run coderelay to start the daemon with the new endpoint.");
+    return;
+  }
+
+  console.log("MCP endpoint token rotated; the previous endpoint is no longer valid.");
+  const activeTransport = previous?.transportProvider;
+  const restartTransport = activeTransport === "disabled" || activeTransport === "local"
+    ? previous?.transportPreference
+    : activeTransport;
+  await startCommand({
+    transport: restartTransport,
+    port: previous?.port,
+    tunnel: activeTransport !== "disabled" && activeTransport !== "local"
+  });
 }
 
 export async function statusCommand(): Promise<void> {
   const state = await readDaemonRuntimeState();
   const registry = new WorkspaceRegistry(CODERELAY_HOME);
   const workspaces = await registry.list();
+  const config = await readDaemonConfig();
+  const transportConfig = resolveTransportConfig(config);
+  const apiKey = readOpenAiApiKeySync();
   if (!state) {
     console.log(`CodeRelay daemon is not running. Registered workspaces: ${workspaces.length}.`);
+    console.log(`Transport preference: ${transportConfig.preferred}`);
+    if (transportConfig.preferred === "openai") {
+      console.log(`OpenAI API key: ${apiKey.source === "missing" ? "missing" : "configured"} (${apiKey.source})`);
+      console.log(`OpenAI tunnel ID: ${resolveOpenAiTunnelId(undefined, config) ?? "not configured"}`);
+      console.log(`tunnel-client process: ${resolveTunnelClient() ? "available; daemon stopped" : "unavailable"}`);
+    } else if (transportConfig.preferred === "cloudflare-named" || transportConfig.preferred === "cloudflare-quick") {
+      const cloudflared = await new CloudflaredTunnelProvider(() => DAEMON_LOG_PATH).runtime();
+      console.log(`cloudflared process: ${cloudflared ? "available; daemon stopped" : "unavailable"}`);
+    }
     return;
   }
   const serverAlive = isProcessAlive(state.pid);
   const localReachable = await health(`${localBaseUrl(state.host, state.port)}/health`);
   let transportAlive = false;
   let transportReachable = false;
-  if (state.transportPid && state.transportProvider !== "disabled") {
+  if (state.transportPid && state.transportProvider !== "disabled" && state.transportProvider !== "local") {
     transportAlive = isProcessAlive(state.transportPid);
     transportReachable = await providerFor(state.transportProvider).healthCheck(processFromState(state));
   }
   const stateLabel = await refreshTransportState(state, transportAlive, transportReachable);
   console.log(`CodeRelay daemon ${serverAlive && localReachable ? "running" : "not healthy"}`);
   console.log(`Registered workspaces: ${workspaces.length}`);
-  console.log(`Transport: ${state.transportProvider}`);
+  console.log(`Transport preference: ${state.transportPreference ?? transportConfig.preferred}`);
+  console.log(`Transport active: ${state.transportProvider}`);
   console.log(`Transport state: ${stateLabel}`);
   console.log(`Local MCP process: ${serverAlive ? "healthy" : "unavailable"}`);
   console.log(`Local MCP /health: ${localReachable ? "healthy" : "unavailable"}`);
-  console.log(`${transportProcessLabel(state.transportProvider)} process: ${state.transportProvider === "disabled" ? "disabled" : transportAlive ? "healthy" : "unavailable"}`);
-  console.log(`${state.transportProvider === "openai" ? "OpenAI tunnel /readyz" : "Public tunnel /health"}: ${state.transportProvider === "disabled" ? "disabled" : transportReachable ? "healthy" : "unavailable"}`);
-  if (state.openaiTunnelId) console.log(`OpenAI tunnel ID: ${state.openaiTunnelId}`);
+  console.log(`${transportProcessLabel(state.transportProvider)} process: ${state.transportProvider === "disabled" || state.transportProvider === "local" ? "disabled" : transportAlive ? "healthy" : "unavailable"}`);
+  console.log(`${state.transportProvider === "openai" ? "OpenAI tunnel /readyz" : "Public tunnel /health"}: ${state.transportProvider === "disabled" || state.transportProvider === "local" ? "disabled" : transportReachable ? "healthy" : "unavailable"}`);
+  if (state.transportProvider === "openai") {
+    console.log(`OpenAI tunnel ID: ${state.openaiTunnelId ?? resolveOpenAiTunnelId(undefined, config) ?? "not configured"}`);
+    console.log(`OpenAI API key: ${apiKey.source === "missing" ? "missing" : "configured"} (${apiKey.source})`);
+    console.log("ChatGPT app: CodeRelay");
+  } else if (state.transportProvider === "cloudflare-named") {
+    const hostname = state.publicBaseUrl ? new URL(state.publicBaseUrl).hostname : config?.cloudflare?.hostname ?? "not configured";
+    console.log(`Public hostname: ${hostname}`);
+    console.log(`Public MCP endpoint: ${state.mcpEndpoint ?? state.endpoint}`);
+  } else if (state.transportProvider === "cloudflare-quick") {
+    console.log(`Public MCP endpoint: ${state.mcpEndpoint ?? state.endpoint}`);
+  } else {
+    console.log(`Local MCP endpoint: ${state.mcpEndpoint ?? state.endpoint}`);
+  }
+  if (state.transportFallbackReason) console.log(`Fallback reason: ${state.transportFallbackReason}`);
   if (state.transportExecutable) console.log(`Transport runtime: ${state.transportExecutable}`);
   console.log(`Started: ${state.startedAt}`);
 }
@@ -464,6 +577,8 @@ export async function removeWorkspaceCommand(name: string): Promise<void> {
 export async function doctorCommand(): Promise<void> {
   const registry = new WorkspaceRegistry(CODERELAY_HOME);
   const state = await readDaemonRuntimeState();
+  const config = await readDaemonConfig();
+  const transportConfig = resolveTransportConfig(config);
   const entries = await registry.describeAll();
   const checks: Array<{ label: string; ok: boolean; detail?: string }> = [];
   let diagnosis: string | undefined;
@@ -472,22 +587,60 @@ export async function doctorCommand(): Promise<void> {
   checks.push({ label: "Git available", ok: commandExists("git"), detail: "Install Git and retry." });
   checks.push({ label: `Workspace registry (${entries.length} registered)`, ok: entries.every((entry) => entry.exists), detail: "Run coderelay workspaces to inspect unavailable roots." });
 
+  const configuredOpenAi = transportConfig.preferred === "openai" || state?.transportProvider === "openai";
+  const configuredNamed = transportConfig.preferred === "cloudflare-named" || state?.transportProvider === "cloudflare-named";
+  if (configuredOpenAi) {
+    const apiKey = readOpenAiApiKeySync();
+    checks.push({ label: `OpenAI API key (${apiKey.source})`, ok: apiKey.source !== "missing", detail: "Set CONTROL_PLANE_API_KEY or run coderelay auth openai." });
+    checks.push({ label: "OpenAI tunnel ID", ok: Boolean(resolveOpenAiTunnelId(undefined, config)), detail: `Configure it with coderelay setup or ${OPENAI_TUNNEL_SETTINGS}` });
+    checks.push({ label: "tunnel-client runtime", ok: resolveTunnelClient() !== null, detail: `Install tunnel-client or set CODERELAY_TUNNEL_CLIENT. See ${OPENAI_TUNNEL_DOCS}` });
+  }
+  if (configuredNamed) {
+    const cloudflareToken = readCloudflareTunnelTokenSync();
+    const cloudflareManagement = config?.cloudflare?.management ?? (cloudflareToken.value ? "remote" : "local");
+    const namedContext: TunnelStartContext = {
+      localPort: 0,
+      localEndpoint: "",
+      workspace: CODERELAY_HOME,
+      instanceName: DAEMON_NAME,
+      cloudflareManagement,
+      cloudflareTunnelToken: cloudflareToken.value,
+      cloudflareTunnel: config?.cloudflare?.tunnel,
+      cloudflareHostname: config?.cloudflare?.hostname,
+      cloudflareConfigPath: config?.cloudflare?.configPath,
+      cloudflareCredentialsFile: config?.cloudflare?.credentialsFile
+    };
+    const named = new CloudflareNamedTunnelProvider(() => DAEMON_LOG_PATH);
+    if (cloudflareManagement === "remote") {
+      checks.push({ label: `Cloudflare tunnel token (${cloudflareToken.source})`, ok: cloudflareToken.source !== "missing", detail: `Run coderelay setup or set CLOUDFLARE_TUNNEL_TOKEN. See ${CLOUDFLARE_REMOTE_TUNNEL_DOCS}` });
+      checks.push({ label: "Cloudflare public hostname", ok: Boolean(config?.cloudflare?.hostname && /^[a-zA-Z0-9.-]+$/u.test(config.cloudflare.hostname)), detail: "Run coderelay setup and enter the hostname configured as the Published Application." });
+      checks.push({ label: "cloudflared runtime", ok: (await named.runtime()) !== null, detail: `Install cloudflared and run the connector. See ${CLOUDFLARE_REMOTE_TUNNEL_DOCS}` });
+    } else {
+      checks.push({ label: "Cloudflare locally-managed tunnel config", ok: await named.isAvailable(namedContext), detail: `Authenticate a locally-managed tunnel and configure it with coderelay setup. See ${CLOUDFLARE_TUNNEL_DOCS}` });
+    }
+  }
+
   if (state) {
     const localProcessOk = isProcessAlive(state.pid);
     const localHealthOk = await health(`${localBaseUrl(state.host, state.port)}/health`);
     checks.push({ label: "Local MCP process", ok: localProcessOk, detail: `Check ${state.serverLog}` });
     checks.push({ label: "Local MCP /health", ok: localHealthOk, detail: `Check ${state.serverLog}` });
-    if (state.transportProvider === "disabled") {
+    if (state.transportProvider === "disabled" || state.transportProvider === "local") {
       checks.push({ label: "Transport process (disabled)", ok: true });
       checks.push({ label: "Public endpoint (disabled)", ok: true });
     } else {
       const runtimeOk = state.transportProvider === "openai"
         ? resolveTunnelClient() !== null
-        : (await new CloudflaredTunnelProvider(() => DAEMON_LOG_PATH).runtime()) !== null;
+        : (state.transportProvider === "cloudflare-named"
+          ? (await new CloudflareNamedTunnelProvider(() => DAEMON_LOG_PATH).runtime()) !== null
+          : (await new CloudflaredTunnelProvider(() => DAEMON_LOG_PATH).runtime()) !== null);
       const provider = providerFor(state.transportProvider);
       const transportProcessOk = isProcessAlive(state.transportPid);
       const transportHealthy = state.transportPid > 0 && await provider.healthCheck(processFromState(state));
-      checks.push({ label: state.transportProvider === "openai" ? "tunnel-client runtime" : "cloudflared runtime", ok: runtimeOk, detail: state.transportProvider === "openai" ? "Install tunnel-client or set CODERELAY_TUNNEL_CLIENT." : "CodeRelay will download a verified runtime on the next start." });
+      const cloudflareDetail = state.transportProvider === "cloudflare-named" && config?.cloudflare?.management === "remote"
+        ? `Install cloudflared and run the connector. See ${CLOUDFLARE_REMOTE_TUNNEL_DOCS}`
+        : `Install cloudflared or use a Quick Tunnel. See ${CLOUDFLARE_TUNNEL_DOCS}`;
+      checks.push({ label: state.transportProvider === "openai" ? "tunnel-client runtime" : "cloudflared runtime", ok: runtimeOk, detail: state.transportProvider === "openai" ? `Install tunnel-client or set CODERELAY_TUNNEL_CLIENT. See ${OPENAI_TUNNEL_DOCS}` : cloudflareDetail });
       checks.push({ label: `${transportProcessLabel(state.transportProvider)} process`, ok: transportProcessOk, detail: `Check ${state.transportLog || "transport status"}` });
       checks.push({ label: state.transportProvider === "openai" ? "OpenAI tunnel /readyz" : "Public tunnel /health", ok: transportHealthy, detail: `Check ${state.transportLog || "transport status"}` });
       await refreshTransportState(state, transportProcessOk, transportHealthy);

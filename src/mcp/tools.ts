@@ -73,7 +73,7 @@ async function requireWorkspace(context: ToolContext, explicitWorkspace?: string
 }
 
 function scopedDescription(description: string): string {
-  return `${description} Pass the optional workspace argument using a registered workspace name or id. Explicit workspace takes precedence over the MCP session cache; if neither is available, the call is rejected. Once selected, keep using the same workspace for subsequent calls in this conversation. Paths outside the selected workspace are inaccessible.`;
+  return `${description} Pass the optional workspace argument using a registered workspace name or id. Explicit workspace takes precedence over the MCP session cache; if neither is available, the call is rejected. The session cache is the default for this logical task context; an explicit registered workspace may be used when the user requests work in another project. Paths outside the selected workspace are inaccessible.`;
 }
 
 function isHidden(relativePath: string): boolean {
@@ -272,7 +272,7 @@ function formatCurrentWorkspace(descriptor: WorkspaceDescriptor): string {
   return JSON.stringify({
     ...workspaceSummary(descriptor),
     chat_binding: descriptor.name,
-    instruction: `Use workspace="${descriptor.name}" for subsequent CodeRelay calls in this conversation. Do not switch workspaces unless the user explicitly requests it.`,
+    instruction: `Use workspace="${descriptor.name}" as the default for this logical task context. To work in another registered workspace, pass workspace explicitly on that call; each call remains isolated.`,
     agents: {
       md: descriptor.agents.md,
       override_md: descriptor.agents.overrideMd
@@ -299,7 +299,7 @@ export function createMcpServer(context: ToolContext): McpServer {
   server.registerTool(
     "use_workspace",
     {
-      description: "Select one registered workspace for this conversation and cache it for stable MCP sessions. Pass the workspace name or id returned by list_workspaces; arbitrary paths are not accepted. Subsequent CodeRelay calls should keep sending workspace with this identity.",
+      description: "Select one registered workspace as the default for this logical task context and cache it for stable MCP sessions. Pass the workspace name or id returned by list_workspaces; arbitrary paths are not accepted. Later calls may pass another registered workspace explicitly when the user requests cross-project work.",
       inputSchema: z.object({ name: z.string().min(1) })
     },
     async ({ name }) => guarded(async () => {

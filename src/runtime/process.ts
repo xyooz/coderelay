@@ -36,7 +36,8 @@ export function spawnDetachedProcess(
   command: string,
   args: string[],
   logPath: string,
-  cwd?: string
+  cwd?: string,
+  env: NodeJS.ProcessEnv = process.env
 ): ChildProcess {
   fs.mkdirSync(path.dirname(logPath), { recursive: true });
   const logFd = fs.openSync(logPath, "a");
@@ -44,7 +45,7 @@ export function spawnDetachedProcess(
     cwd,
     detached: true,
     stdio: ["ignore", logFd, logFd],
-    env: process.env
+    env
   });
   fs.closeSync(logFd);
   child.unref();

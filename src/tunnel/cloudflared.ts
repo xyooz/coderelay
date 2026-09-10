@@ -12,7 +12,7 @@ const CLOUDFLARED_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/iu;
 type LogDirectoryResolver = (instanceName: string) => string;
 
 export class CloudflaredTunnelProvider implements TunnelProvider {
-  readonly name = "cloudflare" as const;
+  readonly name = "cloudflare-quick" as const;
 
   constructor(private readonly logDirectoryResolver: LogDirectoryResolver = instanceLogPath) {}
 
@@ -42,7 +42,7 @@ export class CloudflaredTunnelProvider implements TunnelProvider {
     const baseUrl = await this.waitForUrl(logPath, child.pid ?? 0);
     if (!child.pid) throw new Error("cloudflared did not expose a process id.");
     return {
-      provider: "cloudflare",
+      provider: "cloudflare-quick",
       pid: child.pid,
       baseUrl,
       logPath,

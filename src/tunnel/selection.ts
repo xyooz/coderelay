@@ -1,15 +1,26 @@
 import { CloudflaredTunnelProvider } from "./cloudflared.js";
+import { CloudflareNamedTunnelProvider } from "./cloudflare-named.js";
 import { hasOpenAiConfiguration, OpenAiTunnelProvider } from "./openai.js";
 import type { TunnelProvider, TunnelStartContext } from "./provider.js";
+import type { TransportPreference } from "../runtime/state.js";
 
-export type TransportPreference = "auto" | "openai" | "cloudflare";
+export type { TransportPreference } from "../runtime/state.js";
 
 export async function selectTransport(
   preference: TransportPreference,
   context: TunnelStartContext
 ): Promise<TunnelProvider> {
   const cloudflare = new CloudflaredTunnelProvider();
-  if (preference === "cloudflare") return cloudflare;
+  if (preference === "cloudflare-quick") return cloudflare;
+  if (preference === "local") throw new Error("Local transport does not create a tunnel.");
+
+  const named = new CloudflareNamedTunnelProvider();
+  if (preference === "cloudflare-named") {
+    if (!await named.isAvailable(context)) {
+      throw new Error("Cloudflare Named Tunnel is not configured. Provide a remotely-managed tunnel token and hostname, or configure a locally-managed tunnel, then retry.");
+    }
+    return named;
+  }
 
   const openai = new OpenAiTunnelProvider();
   if (preference === "openai") {
