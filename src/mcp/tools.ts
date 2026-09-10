@@ -12,6 +12,8 @@ import {
   WorkspaceSecurityError
 } from "../workspace/path-security.js";
 import { isSensitiveRelativePath } from "../workspace/sensitive-files.js";
+import { AgentCommandRuntime, type AgentCommandResult } from "../command/runtime.js";
+import { commandDisplay, type CommandRequestInput, type StructuredCommand } from "../command/model.js";
 
 const MAX_FILE_BYTES = 512_000;
 const MAX_SEARCH_FILE_BYTES = 1_000_000;
@@ -63,12 +65,55 @@ const editFileOutputSchema = z.object({
   replacements: z.number().int(),
   message: z.string()
 });
-const commandOutputSchema = z.object({
-  command: z.string(),
+const structuredCommandSchema = z.object({
+  program: z.string().min(1),
+  args: z.array(z.string()).default([])
+});
+const riskOutputSchema = z.object({
+  level: z.enum(["low", "medium", "high", "critical"]),
+  categories: z.array(z.string()),
+  reasons: z.array(z.string())
+});
+const policyOutputSchema = z.object({
+  mode: z.enum(["safe", "workspace", "unrestricted"]),
+  decision: z.string(),
+  rule: z.string()
+});
+const approvalOutputSchema = z.object({
+  required: z.boolean(),
+  source: z.string(),
+  request_id: z.string().optional(),
+  scope_options: z.array(z.enum(["once", "workspace"])).optional()
+});
+const executionOutputSchema = z.object({
   exit_code: z.number().int().nullable(),
   signal: z.string().nullable(),
+  duration_ms: z.number().int(),
+  timed_out: z.boolean()
+});
+const commandExecutionOutputSchema = z.object({
+  command: structuredCommandSchema,
+  exit_code: z.number().int().nullable(),
+  signal: z.string().nullable(),
+  duration_ms: z.number().int(),
+  timed_out: z.boolean(),
   stdout: z.string(),
-  stderr: z.string()
+  stderr: z.string(),
+  truncated: z.boolean()
+});
+const runCommandOutputSchema = z.object({
+  status: z.enum(["success", "approval_required", "denied"]),
+  workspace: z.string(),
+  command: structuredCommandSchema.optional(),
+  commands: z.array(structuredCommandSchema).optional(),
+  stop_on_error: z.boolean().optional(),
+  stopped_on_error: z.boolean().optional(),
+  risk: riskOutputSchema,
+  policy: policyOutputSchema,
+  approval: approvalOutputSchema,
+  execution: executionOutputSchema.optional(),
+  output: z.object({ stdout: z.string(), stderr: z.string(), truncated: z.boolean() }).optional(),
+  results: z.array(commandExecutionOutputSchema).optional()
 });
 const gitDiffOutputSchema = z.object({
   diff: z.string(),
@@ -80,6 +125,7 @@ export interface ToolContext {
   registry: WorkspaceRegistry;
   sessions: WorkspaceSessionManager;
   sessionId: string;
+  commandRuntime: AgentCommandRuntime;
 }
 
 type StructuredContent = Record<string, unknown>;
@@ -328,6 +374,43 @@ function formatCommandResult(command: string, result: Awaited<ReturnType<typeof 
   return sections.join("\n\n");
 }
 
+function formatAgentCommandResult(result: AgentCommandResult): string {
+  if (result.status === "approval_required") {
+    const commands = result.commands ?? (result.command ? [result.command] : []);
+    return [
+      "Approval required before execution.",
+      `Request ID: ${result.approval.request_id ?? "unavailable"}`,
+      `Risk: ${result.risk.level} (${result.risk.categories.join(", ")})`,
+      ...commands.map((command) => `$ ${commandDisplay(command)}`),
+      "Approve locally with: coderelay approve <request_id> --once",
+      "Or approve matching commands for this workspace with: coderelay approve <request_id> --workspace"
+    ].join("\n");
+  }
+  if (result.status === "denied") {
+    return [
+      "Command denied by CodeRelay policy.",
+      `Risk: ${result.risk.level} (${result.risk.categories.join(", ")})`,
+      `Rule: ${result.policy.rule}`,
+      ...result.risk.reasons
+    ].join("\n");
+  }
+
+  if (result.execution && result.command) {
+    return formatCommandResult(commandDisplay(result.command), {
+      exitCode: result.execution.exit_code,
+      signal: result.execution.signal as NodeJS.Signals | null,
+      stdout: result.output?.stdout ?? "",
+      stderr: result.output?.stderr ?? ""
+    });
+  }
+  return (result.results ?? []).map((entry) => formatCommandResult(commandDisplay(entry.command), {
+    exitCode: entry.exit_code,
+    signal: entry.signal,
+    stdout: entry.stdout,
+    stderr: entry.stderr
+  })).join("\n\n") || "No commands were executed.";
+}
+
 function workspaceSummary(descriptor: WorkspaceDescriptor): Record<string, unknown> {
   return {
     id: descriptor.id,
@@ -486,24 +569,35 @@ export function createMcpServer(context: ToolContext): McpServer {
   server.registerTool(
     "run_command",
     {
-      description: scopedDescription("Run a shell-free command from the selected workspace. Dangerous commands and workspace escapes are blocked."),
-      inputSchema: z.object({ workspace: z.string().min(1).optional(), command: z.string(), timeout_ms: z.number().int().min(1_000).max(120_000).default(120_000) }),
-      outputSchema: commandOutputSchema
+      description: scopedDescription("Run one structured command or a sequential list of structured commands from the selected workspace. CodeRelay analyzes risk and may require approval in the local CLI. Legacy string commands remain supported but shell operators are rejected. The command runtime is a workspace policy boundary, not an OS sandbox."),
+      inputSchema: z.object({
+        workspace: z.string().min(1).optional(),
+        command: z.union([z.string(), structuredCommandSchema]).optional(),
+        commands: z.array(structuredCommandSchema).min(1).optional(),
+        stop_on_error: z.boolean().default(true),
+        timeout_ms: z.number().int().min(1_000).max(120_000).default(120_000)
+      }).superRefine((value, issue) => {
+        if ((value.command === undefined) === (value.commands === undefined)) {
+          issue.addIssue({ code: z.ZodIssueCode.custom, message: "Provide exactly one of command or commands." });
+        }
+      }),
+      outputSchema: runCommandOutputSchema
     },
-    async ({ workspace, command, timeout_ms }) => guarded(async () => {
-      const workspaceRoot = (await requireWorkspace(context, workspace)).root;
-      const parsed = validateCommand(command, workspaceRoot);
-      return { command, result: await executeCommand(workspaceRoot, parsed, timeout_ms) };
-    }, ({ command: executedCommand, result }) => ({
-      text: formatCommandResult(executedCommand, result),
-      structuredContent: {
-        command: executedCommand,
-        exit_code: result.exitCode,
-        signal: result.signal,
-        stdout: result.stdout,
-        stderr: result.stderr
+    async ({ workspace, command, commands, stop_on_error, timeout_ms }) => {
+      try {
+        const registeredWorkspace = await requireWorkspace(context, workspace);
+        const input: CommandRequestInput = {
+          command: command as string | StructuredCommand | undefined,
+          commands: commands as StructuredCommand[] | undefined,
+          stopOnError: stop_on_error,
+          timeoutMs: timeout_ms
+        };
+        const result = await context.commandRuntime.run(registeredWorkspace, input);
+        return { content: [{ type: "text", text: formatAgentCommandResult(result) }], structuredContent: result };
+      } catch (error) {
+        return failure(error);
       }
-    }))
+    }
   );
 
   server.registerTool(

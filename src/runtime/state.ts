@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import type { CommandPolicyMode } from "../command/model.js";
 
 export interface WorkspaceConfig {
   workspace: string;
@@ -12,6 +13,7 @@ export interface WorkspaceConfig {
   instanceName?: string;
   transport?: TransportPreference | "cloudflare";
   openaiTunnelId?: string;
+  commandPolicy?: { mode?: CommandPolicyMode };
   /** @deprecated Kept so older .coderelay/config.json files can be read. */
   tunnelProvider?: "cloudflared";
 }
@@ -104,6 +106,7 @@ export interface DaemonConfig {
   cloudflare?: CloudflareConfig;
   /** @deprecated Migrate to openai.tunnelId. */
   openaiTunnelId?: string;
+  commandPolicy?: { mode?: CommandPolicyMode };
   host?: string;
   port?: number;
 }

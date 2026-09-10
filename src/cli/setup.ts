@@ -12,6 +12,7 @@ import {
   type DaemonConfig,
   type TransportPreference
 } from "../runtime/state.js";
+import type { CommandPolicyMode } from "../command/model.js";
 import { resolveTunnelClient } from "../tunnel/openai.js";
 import { resolveInstalledCloudflared } from "../tunnel/download.js";
 import { parseCloudflareTunnelToken } from "../tunnel/cloudflare-named.js";
@@ -234,4 +235,14 @@ export async function configTransportCommand(preferred: TransportPreference): Pr
   const current = await readDaemonConfig() ?? {};
   await writeDaemonConfig(mergeTransport(current, preferred));
   console.log(`Saved transport preference: ${transportName(preferred)}`);
+}
+
+export async function configPolicyCommand(mode: string): Promise<void> {
+  if (mode !== "safe" && mode !== "workspace" && mode !== "unrestricted") {
+    throw new Error(`Unknown command policy mode ${mode}. Choose safe, workspace, or unrestricted.`);
+  }
+  const current = await readDaemonConfig() ?? {};
+  await writeDaemonConfig({ ...current, commandPolicy: { ...(current.commandPolicy ?? {}), mode: mode as CommandPolicyMode } });
+  console.log(`Saved command policy mode: ${mode}`);
+  console.log("Restart CodeRelay for the running daemon to load the new policy.");
 }
