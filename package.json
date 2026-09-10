@@ -1,6 +1,6 @@
 {
   "name": "coderelay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Turn ChatGPT into a local coding agent with secure MCP access.",
   "license": "MIT",
   "type": "module",
@@ -13,7 +13,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=20"
   },
   "scripts": {
     "build": "tsup",

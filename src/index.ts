@@ -1,69 +1,107 @@
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import {
+  addWorkspaceCommand,
   configShowCommand,
   doctorCommand,
+  listCommand,
+  removeWorkspaceCommand,
   restartCommand,
   serveCommand,
   startCommand,
   statusCommand,
-  stopCommand
+  stopCommand,
+  workspacesCommand
 } from "./cli/commands.js";
 
 const program = new Command();
 program
   .name("coderelay")
   .description("Turn ChatGPT into a local coding agent with secure MCP access.")
-  .version("0.1.0");
+  .version("0.2.0");
 
 program
   .command("start")
-  .description("Start the local MCP server and tunnel")
-  .option("--workspace <path>", "workspace directory", process.cwd())
+  .description("Start the single CodeRelay daemon and tunnel")
+  .argument("[workspace]", "optionally register this workspace before starting")
+  .option("--workspace <path>", "workspace directory (legacy alias)")
+  .option("--name <name>", "instance name")
+  .option("--tunnel-id <id>", "OpenAI Secure MCP Tunnel ID")
+  .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare"]))
   .option("--port <number>", "preferred local port", (value) => Number.parseInt(value, 10))
   .option("--no-tunnel", "start locally without a public tunnel")
-  .action(async (options: { workspace: string; port?: number; tunnel?: boolean }) => startCommand(options));
+  .action(async (workspace: string | undefined, options: { workspace?: string; name?: string; tunnelId?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => startCommand({ ...options, workspace: options.workspace ?? workspace }));
 
 program
   .command("serve", { hidden: true })
-  .requiredOption("--workspace <path>", "workspace directory")
+  .requiredOption("--registry-home <path>", "CodeRelay state directory")
+  .requiredOption("--instance-name <name>", "instance name")
   .requiredOption("--host <host>", "bind host")
   .requiredOption("--port <number>", "local port", (value) => Number.parseInt(value, 10))
   .requiredOption("--token <token>", "endpoint token")
-  .action(async (options: { workspace: string; host: string; port: number; token: string }) => serveCommand(options));
+  .action(async (options: { registryHome: string; instanceName: string; host: string; port: number; token: string }) => serveCommand(options));
+
+program
+  .command("add")
+  .description("Register a workspace with the CodeRelay daemon")
+  .argument("<workspace>", "workspace directory")
+  .option("--name <name>", "workspace name")
+  .action(async (workspace: string, options: { name?: string }) => addWorkspaceCommand(workspace, options.name));
+
+program
+  .command("remove")
+  .description("Remove a workspace from the registry")
+  .argument("<name>", "registered workspace name")
+  .action(async (name: string) => removeWorkspaceCommand(name));
+
+program
+  .command("workspaces")
+  .description("List registered workspaces")
+  .action(workspacesCommand);
 
 program
   .command("stop")
   .description("Stop CodeRelay and its tunnel")
-  .action(stopCommand);
+  .argument("[name]", "accepted for compatibility; CodeRelay now has one daemon")
+  .action(async () => stopCommand());
 
 program
   .command("status")
   .description("Show server and tunnel status")
-  .action(statusCommand);
+  .argument("[name]", "accepted for compatibility; CodeRelay now has one daemon")
+  .action(async () => statusCommand());
+
+program
+  .command("list")
+  .description("List registered workspaces")
+  .action(listCommand);
 
 program
   .command("doctor")
   .description("Diagnose local setup and connectivity")
-  .option("--workspace <path>", "workspace directory", process.cwd())
-  .action(async (options: { workspace: string }) => doctorCommand(options.workspace));
+  .action(async () => doctorCommand());
 
 program
   .command("restart")
   .description("Restart CodeRelay")
-  .option("--workspace <path>", "workspace directory", process.cwd())
+  .argument("[name]", "accepted for compatibility; CodeRelay now has one daemon")
+  .option("--workspace <path>", "optionally register this workspace")
+  .option("--name <name>", "instance name override")
+  .option("--tunnel-id <id>", "OpenAI Secure MCP Tunnel ID for this workspace")
+  .addOption(new Option("--transport <transport>", "transport preference").choices(["auto", "openai", "cloudflare"]))
   .option("--port <number>", "preferred local port", (value) => Number.parseInt(value, 10))
   .option("--no-tunnel", "restart locally without a public tunnel")
-  .action(async (options: { workspace: string; port?: number; tunnel?: boolean }) => restartCommand(options));
+  .action(async (_name: string | undefined, options: { workspace?: string; name?: string; tunnelId?: string; transport?: "auto" | "openai" | "cloudflare"; port?: number; tunnel?: boolean }) => restartCommand(options));
 
 program
   .command("config")
-  .description("Inspect generated workspace configuration")
+  .description("Inspect daemon configuration")
   .command("show")
-  .option("--workspace <path>", "workspace directory", process.cwd())
-  .action(async (options: { workspace: string }) => configShowCommand(options.workspace));
+  .action(async () => configShowCommand());
 
 const args = process.argv.slice(2);
+const commands = new Set(["start", "serve", "add", "remove", "workspaces", "stop", "status", "list", "doctor", "restart", "config"]);
 if (args.length === 0) args.push("start");
+else if (!commands.has(args[0]) && !["--help", "-h", "--version", "-V"].includes(args[0])) args.unshift("start");
 
 program.parseAsync([process.argv[0], process.argv[1], ...args]).catch((error: unknown) => {
   console.error(`CodeRelay error: ${error instanceof Error ? error.message : String(error)}`);

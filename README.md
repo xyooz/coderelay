@@ -2,108 +2,130 @@
 
 **Turn ChatGPT into a local coding agent in 30 seconds.**
 
-No API key. No copy-paste. No manual MCP configuration.
+CodeRelay runs one local daemon, one secure tunnel, and serves multiple registered workspaces. Each ChatGPT MCP session selects its own workspace, so two chats can work on two projects without sharing a global “current project”.
 
 ```bash
-cd your-project
 npx coderelay
 ```
 
-Then add the printed MCP endpoint to ChatGPT and ask:
-
-> Analyze this project and tell me how it is structured.
-
-CodeRelay gives ChatGPT a small, safe toolset for your current repository:
-
-- List and search code
-- Read, create, and edit files
-- Run tests and builds
-- Inspect Git diffs
-- Stay inside the workspace
-
-## Requirements
-
-- Node.js 22 or newer
-- Git
-- Internet access on first start so CodeRelay can download its tunnel runtime
-
-CodeRelay uses a Cloudflare Quick Tunnel. It does not require a Cloudflare account, API key, `sudo`, or a package manager. If `cloudflared` is already on `PATH`, CodeRelay uses it; otherwise it downloads a verified platform binary into `~/.coderelay/bin/` and reuses it on later starts. The tunnel URL is temporary and changes when CodeRelay restarts.
-
-## Commands
+Or install it globally:
 
 ```bash
-coderelay              # same as coderelay start
-coderelay start
-coderelay stop
+npm install --global coderelay
+coderelay
+```
+
+## Quick start
+
+Register projects once:
+
+```bash
+coderelay add ~/Projects/attendance
+coderelay add ~/Projects/docseek
+coderelay workspaces
+```
+
+Start the single daemon:
+
+```bash
+coderelay
+```
+
+Connect the one CodeRelay MCP app in ChatGPT. Treat one ChatGPT chat as one project context: ask CodeRelay to call `list_workspaces`, then `use_workspace` with the project name. CodeRelay returns the workspace identity and instructions for the conversation. For clients that recreate MCP sessions, workspace-scoped tools also accept the registered workspace name explicitly; explicit workspace takes precedence over the transport session cache.
+
+The common tools are:
+
+- `list_files`, `read_file`, and `search_code`
+- `write_file` and `edit_file`
+- `run_command`
+- `git_diff`
+
+Before using a file or command tool, either pass `workspace: "project-name"` or call `use_workspace` first. `workspace` accepts only a registry name or id, never an arbitrary path. Keep using the same workspace in a chat and start a new chat for another project when possible.
+
+For example:
+
+```text
+use_workspace({ name: "attendance" })
+read_file({ workspace: "attendance", path: "README.md" })
+run_command({ workspace: "attendance", command: "npm test" })
+```
+
+## Secure transport
+
+CodeRelay automatically prefers the official OpenAI Secure MCP Tunnel when all of these are available:
+
+- `CONTROL_PLANE_API_KEY` in the environment
+- a configured tunnel ID
+- the official `tunnel-client` executable
+
+The API key is read only from the environment. It is never written to the registry, project, or runtime state.
+
+Configure a tunnel ID once for the daemon:
+
+```bash
+export CONTROL_PLANE_API_KEY="sk-..."
+coderelay --tunnel-id "tunnel_..."
+```
+
+When OpenAI transport is unavailable in automatic mode, CodeRelay falls back to a Cloudflare Quick Tunnel. No Cloudflare account or API key is required. An existing `cloudflared` on `PATH` is preferred; otherwise CodeRelay downloads a pinned official binary and verifies its SHA256 before execution.
+
+Force a provider when needed:
+
+```bash
+coderelay --transport openai
+coderelay --transport cloudflare
+```
+
+For local-only testing:
+
+```bash
+coderelay --no-tunnel
+```
+
+The daemon and local MCP server remain available while a public tunnel is warming up. `coderelay status` and `coderelay doctor` distinguish the local MCP process, transport process, and public endpoint.
+
+For diagnosing MCP session behavior, start the daemon with request tracing enabled:
+
+```bash
+CODERELAY_MCP_TRACE=1 coderelay
+```
+
+The trace is written to the daemon server log under `~/.coderelay/daemon/logs/`. Each line records the JSON-RPC method, tool name, incoming and outgoing `Mcp-Session-Id`, transport session ID, internal session ID, route (`new`/`existing`/`missing`), explicit workspace, session-cached workspace, resolved workspace, resolution source, and workspace binding before and after the request.
+
+## Workspace registry
+
+```bash
+coderelay add <path> [--name <name>]
+coderelay remove <name>
+coderelay workspaces
 coderelay status
-coderelay doctor
+coderelay stop
 coderelay restart
-coderelay config show
+coderelay doctor
 ```
 
-The public Quick Tunnel may need a short warm-up after its URL is created. CodeRelay waits with bounded exponential backoff and retries the tunnel once if the public health check remains unavailable. During that time, the local MCP server stays running; use `coderelay status` or `coderelay doctor` to distinguish the local server, the `cloudflared` process, and the public endpoint.
+Names default to the directory name. Collisions receive `-2`, `-3`, and so on. The registry stores canonical workspace roots in:
 
-For local development or security checks without a public endpoint:
-
-```bash
-coderelay start --no-tunnel
+```text
+~/.coderelay/workspaces.json
 ```
+
+The daemon runtime and logs are kept outside projects:
+
+```text
+~/.coderelay/daemon/runtime.json
+~/.coderelay/daemon/logs/
+```
+
+At session binding time, CodeRelay discovers root-level `AGENTS.md` and `AGENTS.override.md` and exposes their contents through `current_workspace`. They are read-only context; CodeRelay does not generate or modify them.
 
 ## Security defaults
 
-CodeRelay binds the MCP server to `127.0.0.1`, uses a random token in the endpoint path, and rejects browser origins that do not match the request host.
+CodeRelay binds the MCP server to `127.0.0.1`, protects the endpoint with a random path token, and rejects browser origins that do not match the request host.
 
-File access is canonicalized and constrained to the workspace. Symlink escapes are rejected. Sensitive files are blocked by default, including:
+Every file path is canonicalized and checked against the selected workspace. Symlink escapes, `..` traversal, and sensitive files are blocked. Commands run with `shell: false`; pipes, redirects, chaining, privilege escalation, destructive Git operations, and recursive deletion are rejected.
 
-```text
-.env, .env.*, *.pem, *.key, id_rsa, id_ed25519, credentials, .aws/, .ssh/
-```
-
-Commands run without a shell, so pipes, redirects, command substitution, and shell chaining are rejected. The MVP also blocks `sudo`, `su`, shutdown/reboot tools, recursive `rm`, `git push`, `git reset --hard`, `git clean -fd`, and `git checkout -- .`.
-
-This is a local developer tool, not a complete authorization framework. Review the endpoint and the model's proposed changes before accepting destructive edits.
-
-## Generated state
-
-The current workspace receives:
-
-```text
-.coderelay/config.json
-```
-
-Runtime state and logs live outside the repository:
-
-```text
-~/.coderelay/runtime.json
-~/.coderelay/logs/
-~/.coderelay/bin/cloudflared
-```
-
-The workspace `.coderelay/` directory is ignored by Git.
-
-## How it works
-
-```text
-ChatGPT
-   │
-   │ MCP
-   ▼
-CodeRelay
-   │
-   ├── Read / Edit
-   ├── Search
-   ├── Test / Build
-   └── Git Diff
-   │
-   ▼
-Your Repository
-```
-
-```text
-Local server:     127.0.0.1
-Public access:    temporary Cloudflare Quick Tunnel
-Workspace access: current repository only
-```
+The endpoint is a local developer tool, not a replacement for reviewing proposed edits or commands.
 
 ## Development
 
@@ -116,7 +138,7 @@ npm run test:e2e
 npm run pack:check
 ```
 
-The MCP server is built with the official MCP TypeScript SDK and served over Streamable HTTP. The first release intentionally avoids GUI, multi-agent routing, memory, indexing, and cloud account features.
+The E2E suite covers one daemon, two MCP sessions, independent workspace bindings, concurrent access, workspace switching, traversal and symlink rejection, AGENTS context, and registry persistence.
 
 ## License
 

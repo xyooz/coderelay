@@ -1,6 +1,19 @@
+import type { TransportProviderName } from "../runtime/state.js";
+
+export interface TunnelStartContext {
+  localPort: number;
+  localEndpoint: string;
+  workspace: string;
+  instanceName: string;
+  openaiTunnelId?: string;
+}
+
 export interface TunnelProcess {
+  provider: TransportProviderName;
   pid: number;
-  baseUrl: string;
+  baseUrl?: string;
+  healthUrl?: string;
+  tunnelId?: string;
   logPath: string;
   executablePath: string;
   executableSource: "path" | "cache" | "download";
@@ -8,9 +21,9 @@ export interface TunnelProcess {
 }
 
 export interface TunnelProvider {
-  readonly name: string;
-  isAvailable(): Promise<boolean>;
-  start(localPort: number): Promise<TunnelProcess>;
-  healthCheck(baseUrl: string): Promise<boolean>;
-  stop(pid: number): Promise<void>;
+  readonly name: TransportProviderName;
+  isAvailable(context?: TunnelStartContext): Promise<boolean>;
+  start(context: TunnelStartContext): Promise<TunnelProcess>;
+  healthCheck(process: TunnelProcess): Promise<boolean>;
+  stop(process: TunnelProcess): Promise<void>;
 }
