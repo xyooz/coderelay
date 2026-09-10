@@ -2,15 +2,19 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
-import { LOG_PATH } from "../runtime/state.js";
+import { instanceLogPath } from "../runtime/state.js";
 import { terminateProcess } from "../runtime/process.js";
 import { ensureCloudflared, resolveInstalledCloudflared, type CloudflaredRuntime } from "./download.js";
-import type { TunnelProcess, TunnelProvider } from "./provider.js";
+import type { TunnelProcess, TunnelProvider, TunnelStartContext } from "./provider.js";
 
 const CLOUDFLARED_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/iu;
 
+type LogDirectoryResolver = (instanceName: string) => string;
+
 export class CloudflaredTunnelProvider implements TunnelProvider {
-  readonly name = "cloudflared" as const;
+  readonly name = "cloudflare" as const;
+
+  constructor(private readonly logDirectoryResolver: LogDirectoryResolver = instanceLogPath) {}
 
   async isAvailable(): Promise<boolean> {
     return (await resolveInstalledCloudflared()) !== null;
@@ -20,13 +24,14 @@ export class CloudflaredTunnelProvider implements TunnelProvider {
     return await resolveInstalledCloudflared();
   }
 
-  async start(localPort: number): Promise<TunnelProcess> {
+  async start(context: TunnelStartContext): Promise<TunnelProcess> {
     const executable = await ensureCloudflared();
 
-    await fs.mkdir(LOG_PATH, { recursive: true });
-    const logPath = path.join(LOG_PATH, `cloudflared-${Date.now()}.log`);
+    const logDirectory = this.logDirectoryResolver(context.instanceName);
+    await fs.mkdir(logDirectory, { recursive: true });
+    const logPath = path.join(logDirectory, `cloudflared-${Date.now()}.log`);
     const logFd = fsSync.openSync(logPath, "a");
-    const child = spawn(executable.path, ["tunnel", "--url", `http://127.0.0.1:${localPort}`, "--no-autoupdate"], {
+    const child = spawn(executable.path, ["tunnel", "--url", `http://127.0.0.1:${context.localPort}`, "--no-autoupdate"], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
       env: process.env
@@ -37,6 +42,7 @@ export class CloudflaredTunnelProvider implements TunnelProvider {
     const baseUrl = await this.waitForUrl(logPath, child.pid ?? 0);
     if (!child.pid) throw new Error("cloudflared did not expose a process id.");
     return {
+      provider: "cloudflare",
       pid: child.pid,
       baseUrl,
       logPath,
@@ -46,9 +52,10 @@ export class CloudflaredTunnelProvider implements TunnelProvider {
     };
   }
 
-  async healthCheck(baseUrl: string): Promise<boolean> {
+  async healthCheck(process: TunnelProcess): Promise<boolean> {
+    if (!process.baseUrl) return false;
     try {
-      const response = await fetch(new URL("/health", baseUrl), {
+      const response = await fetch(new URL("/health", process.baseUrl), {
         signal: AbortSignal.timeout(5_000)
       });
       return response.ok;
@@ -57,8 +64,8 @@ export class CloudflaredTunnelProvider implements TunnelProvider {
     }
   }
 
-  async stop(pid: number): Promise<void> {
-    await terminateProcess(pid);
+  async stop(process: TunnelProcess): Promise<void> {
+    await terminateProcess(process.pid);
   }
 
   private async waitForUrl(logPath: string, pid: number, timeoutMs = 30_000): Promise<string> {
