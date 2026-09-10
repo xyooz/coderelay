@@ -21,11 +21,13 @@ import {
   DAEMON_LOG_PATH,
   defaultInstanceName,
   ensureDaemonStateDirectories,
+  getOrCreateMcpEndpointToken,
   isProcessAlive,
   readCloudflareTunnelTokenSync,
   readDaemonConfig,
   readDaemonRuntimeState,
   readOpenAiApiKeySync,
+  rotateMcpEndpointToken,
   resolveConfiguredOpenAiTunnelId,
   resolveTransportConfig,
   removeDaemonRuntimeState,
@@ -38,7 +40,6 @@ import {
   commandExists,
   currentEntryPoint,
   findAvailablePort,
-  randomToken,
   spawnDetachedProcess,
   terminateProcess,
   waitForHttp
@@ -238,7 +239,7 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
   // CLI transport and tunnel-id flags intentionally affect only this run.
   await ensureDaemonIsStopped();
   await ensureDaemonStateDirectories();
-  const token = randomToken();
+  const token = await getOrCreateMcpEndpointToken();
   const timestamp = new Date().toISOString().replace(/[:.]/gu, "-");
   const serverLog = path.join(DAEMON_LOG_PATH, `server-${timestamp}.log`);
   const serverCommand = serverChildCommand([
@@ -246,10 +247,15 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
     "--registry-home", CODERELAY_HOME,
     "--instance-name", DAEMON_NAME,
     "--host", host,
-    "--port", String(port),
-    "--token", token
+    "--port", String(port)
   ]);
-  const serverProcess = spawnDetachedProcess(serverCommand.command, serverCommand.args, serverLog, CODERELAY_HOME);
+  const serverProcess = spawnDetachedProcess(
+    serverCommand.command,
+    serverCommand.args,
+    serverLog,
+    CODERELAY_HOME,
+    { ...process.env, CODERELAY_MCP_ENDPOINT_TOKEN: token }
+  );
   const serverPid = serverProcess.pid;
   if (!serverPid) throw new Error("Could not start the local MCP daemon.");
 
@@ -409,6 +415,7 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
 }
 
 export async function serveCommand(options: ServeOptions): Promise<void> {
+  if (!options.token) throw new Error("MCP endpoint token is missing.");
   await runMcpServer({
     registryHome: options.registryHome ?? CODERELAY_HOME,
     instanceName: options.instanceName,
@@ -443,6 +450,38 @@ export async function stopCommand(): Promise<void> {
   await terminateProcess(state.pid);
   await removeDaemonRuntimeState();
   console.log("Stopped CodeRelay daemon.");
+}
+
+export async function endpointCommand(): Promise<void> {
+  const state = await readDaemonRuntimeState();
+  if (!state || !isProcessAlive(state.pid)) {
+    console.log("CodeRelay daemon is not running; no active MCP endpoint.");
+    return;
+  }
+  console.log(`MCP endpoint: ${state.mcpEndpoint ?? state.endpoint}`);
+}
+
+export async function rotateEndpointCommand(): Promise<void> {
+  const previous = await readDaemonRuntimeState();
+  const wasRunning = Boolean(previous && isProcessAlive(previous.pid));
+  if (wasRunning) await stopCommand();
+
+  await rotateMcpEndpointToken();
+  if (!wasRunning) {
+    console.log("MCP endpoint token rotated. Run coderelay to start the daemon with the new endpoint.");
+    return;
+  }
+
+  console.log("MCP endpoint token rotated; the previous endpoint is no longer valid.");
+  const activeTransport = previous?.transportProvider;
+  const restartTransport = activeTransport === "disabled" || activeTransport === "local"
+    ? previous?.transportPreference
+    : activeTransport;
+  await startCommand({
+    transport: restartTransport,
+    port: previous?.port,
+    tunnel: activeTransport !== "disabled" && activeTransport !== "local"
+  });
 }
 
 export async function statusCommand(): Promise<void> {

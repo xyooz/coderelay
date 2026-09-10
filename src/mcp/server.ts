@@ -302,5 +302,8 @@ export async function runMcpServer(options: ServeOptions): Promise<void> {
     console.error(error);
     void shutdown();
   });
-  console.error(`CodeRelay daemon listening on http://${options.host}:${options.port}${running.endpointPath}`);
+  // Never write the endpoint token to the daemon log. The CLI prints the
+  // endpoint when the user explicitly asks for it, but logs and traces must
+  // remain safe to share.
+  console.error(`CodeRelay daemon listening on http://${options.host}:${options.port}`);
 }

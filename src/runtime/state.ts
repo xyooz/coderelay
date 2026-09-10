@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -36,6 +37,9 @@ export interface CloudflareConfig {
 }
 
 export interface CredentialsFile {
+  mcp?: {
+    endpointToken?: string;
+  };
   openai?: {
     apiKey?: string;
   };
@@ -57,6 +61,9 @@ export interface CloudflareTokenResolution {
   value?: string;
   source: CloudflareTokenSource;
 }
+
+const MCP_ENDPOINT_TOKEN_BYTES = 24;
+const MCP_ENDPOINT_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/u;
 
 export interface RuntimeState {
   instanceName: string;
@@ -274,6 +281,40 @@ export async function writeOpenAiApiKey(apiKey: string, credentialsPath = CREDEN
 export async function writeCloudflareTunnelToken(token: string, credentialsPath = CREDENTIALS_PATH): Promise<void> {
   const current = await readCredentials(credentialsPath);
   await writeCredentials({ ...current, cloudflare: { ...(current?.cloudflare ?? {}), tunnelToken: token } }, credentialsPath);
+}
+
+export function generateMcpEndpointToken(): string {
+  return randomBytes(MCP_ENDPOINT_TOKEN_BYTES).toString("base64url");
+}
+
+export function readMcpEndpointTokenSync(credentialsPath = CREDENTIALS_PATH): string | undefined {
+  try {
+    const parsed = JSON.parse(fsSync.readFileSync(credentialsPath, "utf8")) as CredentialsFile;
+    const token = parsed.mcp?.endpointToken;
+    return token && MCP_ENDPOINT_TOKEN_PATTERN.test(token) ? token : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function writeMcpEndpointToken(token: string, credentialsPath = CREDENTIALS_PATH): Promise<void> {
+  if (!MCP_ENDPOINT_TOKEN_PATTERN.test(token)) throw new Error("MCP endpoint token has an invalid format.");
+  const current = await readCredentials(credentialsPath);
+  await writeCredentials({ ...current, mcp: { ...(current?.mcp ?? {}), endpointToken: token } }, credentialsPath);
+}
+
+export async function getOrCreateMcpEndpointToken(credentialsPath = CREDENTIALS_PATH): Promise<string> {
+  const existing = readMcpEndpointTokenSync(credentialsPath);
+  if (existing) return existing;
+  const token = generateMcpEndpointToken();
+  await writeMcpEndpointToken(token, credentialsPath);
+  return token;
+}
+
+export async function rotateMcpEndpointToken(credentialsPath = CREDENTIALS_PATH): Promise<string> {
+  const token = generateMcpEndpointToken();
+  await writeMcpEndpointToken(token, credentialsPath);
+  return token;
 }
 
 export async function removeOpenAiApiKey(credentialsPath = CREDENTIALS_PATH): Promise<void> {

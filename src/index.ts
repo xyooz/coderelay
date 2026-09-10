@@ -3,9 +3,11 @@ import {
   addWorkspaceCommand,
   configShowCommand,
   doctorCommand,
+  endpointCommand,
   listCommand,
   removeWorkspaceCommand,
   restartCommand,
+  rotateEndpointCommand,
   serveCommand,
   startCommand,
   statusCommand,
@@ -51,8 +53,11 @@ program
   .requiredOption("--instance-name <name>", "instance name")
   .requiredOption("--host <host>", "bind host")
   .requiredOption("--port <number>", "local port", (value) => Number.parseInt(value, 10))
-  .requiredOption("--token <token>", "endpoint token")
-  .action(async (options: { registryHome: string; instanceName: string; host: string; port: number; token: string }) => serveCommand(options));
+  .option("--token <token>", "endpoint token (legacy; normally passed through the environment)")
+  .action(async (options: { registryHome: string; instanceName: string; host: string; port: number; token?: string }) => serveCommand({
+    ...options,
+    token: options.token ?? process.env.CODERELAY_MCP_ENDPOINT_TOKEN ?? ""
+  }));
 
 program
   .command("add")
@@ -94,6 +99,15 @@ program
   .description("Diagnose local setup and connectivity")
   .action(async () => doctorCommand());
 
+const endpoint = program
+  .command("endpoint")
+  .description("Show the active MCP endpoint");
+endpoint.action(endpointCommand);
+endpoint
+  .command("rotate")
+  .description("Rotate the MCP endpoint token and invalidate the previous endpoint")
+  .action(rotateEndpointCommand);
+
 program
   .command("restart")
   .description("Restart CodeRelay")
@@ -115,7 +129,7 @@ config.command("transport")
   .action(async (transport: string) => configTransportCommand(transport as TransportPreference));
 
 const args = process.argv.slice(2);
-const commands = new Set(["start", "setup", "serve", "auth", "add", "remove", "workspaces", "stop", "status", "list", "doctor", "restart", "config"]);
+const commands = new Set(["start", "setup", "serve", "auth", "add", "remove", "workspaces", "stop", "status", "list", "doctor", "endpoint", "restart", "config"]);
 if (args.length === 0) args.push("start");
 else if (!commands.has(args[0]) && !["--help", "-h", "--version", "-V"].includes(args[0])) args.unshift("start");
 

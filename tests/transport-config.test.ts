@@ -4,9 +4,12 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   normalizeDaemonConfig,
+  getOrCreateMcpEndpointToken,
   readCloudflareTunnelTokenSync,
+  readMcpEndpointTokenSync,
   readOpenAiApiKeySync,
   removeOpenAiApiKey,
+  rotateMcpEndpointToken,
   resolveTransportConfig,
   writeCloudflareTunnelToken,
   writeOpenAiApiKey,
@@ -70,6 +73,26 @@ describe("transport configuration", () => {
     try {
       await writeOpenAiApiKey("file-value", credentialsPath);
       expect(readOpenAiApiKeySync("environment-value", credentialsPath)).toEqual({ value: "environment-value", source: "environment" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("persists the MCP endpoint token, preserves it, and rotates it atomically", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "coderelay-endpoint-credentials-"));
+    const credentialsPath = path.join(directory, "credentials.json");
+    try {
+      const first = await getOrCreateMcpEndpointToken(credentialsPath);
+      expect(first).toMatch(/^[A-Za-z0-9_-]{32}$/u);
+      expect(await getOrCreateMcpEndpointToken(credentialsPath)).toBe(first);
+      expect(readMcpEndpointTokenSync(credentialsPath)).toBe(first);
+      expect((await stat(credentialsPath)).mode & 0o777).toBe(0o600);
+
+      const rotated = await rotateMcpEndpointToken(credentialsPath);
+      expect(rotated).not.toBe(first);
+      expect(readMcpEndpointTokenSync(credentialsPath)).toBe(rotated);
+      expect(JSON.parse(await readFile(credentialsPath, "utf8"))).toEqual({ mcp: { endpointToken: rotated } });
+      expect((await stat(credentialsPath)).mode & 0o777).toBe(0o600);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

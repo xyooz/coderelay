@@ -77,6 +77,20 @@ coderelay --no-tunnel
 
 Saved non-secret settings live in `~/.coderelay/config.json`. The OpenAI API key, if saved, lives separately in `~/.coderelay/credentials.json` with mode `0600`; `~/.coderelay` is kept at mode `0700`.
 
+The MCP endpoint path token is generated once with a cryptographically secure random source and is also kept in `~/.coderelay/credentials.json`. It survives daemon restarts and transport changes. Show the active endpoint with:
+
+```bash
+coderelay endpoint
+```
+
+To invalidate the old URL and issue a new token:
+
+```bash
+coderelay endpoint rotate
+```
+
+The rotate command restarts a running daemon so the old endpoint immediately stops responding.
+
 OpenAI credentials use this precedence:
 
 1. `CONTROL_PLANE_API_KEY`
@@ -130,6 +144,8 @@ coderelay status
 coderelay stop
 coderelay restart
 coderelay doctor
+coderelay endpoint
+coderelay endpoint rotate
 ```
 
 Names default to the directory name. Collisions receive `-2`, `-3`, and so on. The registry stores canonical workspace roots in:
