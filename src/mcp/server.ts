@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { WorkspaceSessionManager } from "./session.js";
-import { inspectMcpRequest, waitForMcpResponse, writeMcpTrace, type McpRequestInfo, type McpTraceEvent } from "./tracing.js";
+import { inspectMcpRequest, mcpTraceEnabled, waitForMcpResponse, writeMcpTrace, type McpRequestInfo, type McpTraceEvent } from "./tracing.js";
 import { createMcpServer } from "./tools.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { CODERELAY_HOME } from "../runtime/state.js";
@@ -78,14 +78,14 @@ class StatefulMcpHandler {
     const requestInfo = await inspectMcpRequest(request);
     if (this.closed) {
       const response = sessionNotFound();
-      writeMcpTrace(this.traceEvent(request, requestInfo, {
+      await this.writeTrace(request, requestInfo, {
         internalSessionId: null,
         route: "closed",
         workspaceBindingBefore: null,
         workspaceBindingAfter: null,
         transportSessionId: null,
         outgoingSessionId: response.headers.get("mcp-session-id")
-      }));
+      });
       return response;
     }
 
@@ -94,28 +94,28 @@ class StatefulMcpHandler {
       const entry = this.entries.get(externalId);
       if (!entry) {
         const response = sessionNotFound();
-        writeMcpTrace(this.traceEvent(request, requestInfo, {
+        await this.writeTrace(request, requestInfo, {
           internalSessionId: null,
           route: "missing",
           workspaceBindingBefore: null,
           workspaceBindingAfter: null,
           transportSessionId: null,
           outgoingSessionId: response.headers.get("mcp-session-id")
-        }));
+        });
         return response;
       }
 
       const bindingBefore = this.sessions.current(entry.internalId);
       const response = await entry.transport.handleRequest(request);
       await waitForMcpResponse(response);
-      writeMcpTrace(this.traceEvent(request, requestInfo, {
+      await this.writeTrace(request, requestInfo, {
         internalSessionId: entry.internalId,
         route: "existing",
         workspaceBindingBefore: bindingBefore ?? null,
         workspaceBindingAfter: this.sessions.current(entry.internalId) ?? null,
         transportSessionId: entry.transport.sessionId ?? null,
         outgoingSessionId: response.headers.get("mcp-session-id")
-      }));
+      });
       return response;
     }
 
@@ -166,14 +166,14 @@ class StatefulMcpHandler {
       // The initialization callback runs before handleRequest resolves. Keep
       // this defensive registration for SDK versions that defer the callback.
       if (transport.sessionId && !this.entries.has(transport.sessionId)) this.entries.set(transport.sessionId, entry);
-      writeMcpTrace(this.traceEvent(request, requestInfo, {
+      await this.writeTrace(request, requestInfo, {
         internalSessionId: internalId,
         route: "new",
         workspaceBindingBefore: null,
         workspaceBindingAfter: this.sessions.current(internalId) ?? null,
         transportSessionId: transport.sessionId ?? null,
         outgoingSessionId: response.headers.get("mcp-session-id")
-      }));
+      });
       return response;
     } catch (error) {
       this.sessions.clear(internalId);
@@ -188,18 +188,34 @@ class StatefulMcpHandler {
     this.sessions.clear(internalId);
   }
 
-  private traceEvent(
+  private async writeTrace(
     request: Request,
     requestInfo: McpRequestInfo,
-    state: Omit<McpTraceEvent, "httpMethod" | "rpcMethod" | "toolName" | "incomingSessionId">
-  ): McpTraceEvent {
-    return {
+    state: Omit<McpTraceEvent, "httpMethod" | "rpcMethod" | "toolName" | "incomingSessionId" | "explicitWorkspace" | "sessionWorkspace" | "resolvedWorkspace" | "resolutionSource">
+  ): Promise<void> {
+    if (!mcpTraceEnabled()) return;
+    const sessionWorkspace = state.workspaceBindingBefore;
+    const resolutionSource = requestInfo.explicitWorkspace
+      ? "explicit"
+      : sessionWorkspace
+        ? "session"
+        : "none";
+    const resolvedEntry = requestInfo.explicitWorkspace
+      ? await this.registry.get(requestInfo.explicitWorkspace)
+      : sessionWorkspace
+        ? await this.registry.get(sessionWorkspace)
+        : null;
+    writeMcpTrace({
       httpMethod: request.method,
       rpcMethod: requestInfo.rpcMethod,
       toolName: requestInfo.toolName,
       incomingSessionId: request.headers.get("mcp-session-id"),
+      explicitWorkspace: requestInfo.explicitWorkspace,
+      sessionWorkspace,
+      resolvedWorkspace: resolvedEntry?.name ?? null,
+      resolutionSource,
       ...state
-    };
+    });
   }
 }
 

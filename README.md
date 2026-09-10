@@ -31,7 +31,7 @@ Start the single daemon:
 coderelay
 ```
 
-Connect the one CodeRelay MCP app in ChatGPT. In each chat, ask CodeRelay to call `list_workspaces`, then `use_workspace` with the project name. The workspace selection belongs to that MCP session only.
+Connect the one CodeRelay MCP app in ChatGPT. Treat one ChatGPT chat as one project context: ask CodeRelay to call `list_workspaces`, then `use_workspace` with the project name. CodeRelay returns the workspace identity and instructions for the conversation. For clients that recreate MCP sessions, workspace-scoped tools also accept the registered workspace name explicitly; explicit workspace takes precedence over the transport session cache.
 
 The common tools are:
 
@@ -40,7 +40,15 @@ The common tools are:
 - `run_command`
 - `git_diff`
 
-Before using a file or command tool, a session must select a registered workspace. `use_workspace` accepts a registry name, never an arbitrary path.
+Before using a file or command tool, either pass `workspace: "project-name"` or call `use_workspace` first. `workspace` accepts only a registry name or id, never an arbitrary path. Keep using the same workspace in a chat and start a new chat for another project when possible.
+
+For example:
+
+```text
+use_workspace({ name: "attendance" })
+read_file({ workspace: "attendance", path: "README.md" })
+run_command({ workspace: "attendance", command: "npm test" })
+```
 
 ## Secure transport
 
@@ -82,7 +90,7 @@ For diagnosing MCP session behavior, start the daemon with request tracing enabl
 CODERELAY_MCP_TRACE=1 coderelay
 ```
 
-The trace is written to the daemon server log under `~/.coderelay/daemon/logs/`. Each line records the JSON-RPC method, tool name, incoming and outgoing `Mcp-Session-Id`, transport session ID, internal session ID, route (`new`/`existing`/`missing`), and workspace binding before and after the request.
+The trace is written to the daemon server log under `~/.coderelay/daemon/logs/`. Each line records the JSON-RPC method, tool name, incoming and outgoing `Mcp-Session-Id`, transport session ID, internal session ID, route (`new`/`existing`/`missing`), explicit workspace, session-cached workspace, resolved workspace, resolution source, and workspace binding before and after the request.
 
 ## Workspace registry
 

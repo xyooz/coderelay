@@ -1,6 +1,7 @@
 export interface McpRequestInfo {
   rpcMethod: string | null;
   toolName: string | null;
+  explicitWorkspace: string | null;
 }
 
 export interface McpTraceEvent extends McpRequestInfo {
@@ -11,6 +12,9 @@ export interface McpTraceEvent extends McpRequestInfo {
   route: "new" | "existing" | "missing" | "closed";
   workspaceBindingBefore: string | null;
   workspaceBindingAfter: string | null;
+  sessionWorkspace: string | null;
+  resolvedWorkspace: string | null;
+  resolutionSource: "explicit" | "session" | "none";
   outgoingSessionId: string | null;
 }
 
@@ -27,13 +31,13 @@ export function mcpTraceEnabled(): boolean {
  */
 export async function inspectMcpRequest(request: Request): Promise<McpRequestInfo> {
   if (!mcpTraceEnabled() || request.method !== "POST") {
-    return { rpcMethod: null, toolName: null };
+    return { rpcMethod: null, toolName: null, explicitWorkspace: null };
   }
 
   try {
     const body = await request.clone().json() as unknown;
     const message = Array.isArray(body) ? body[0] : body;
-    if (!message || typeof message !== "object") return { rpcMethod: null, toolName: null };
+    if (!message || typeof message !== "object") return { rpcMethod: null, toolName: null, explicitWorkspace: null };
 
     const record = message as Record<string, unknown>;
     const rpcMethod = typeof record.method === "string" ? record.method : null;
@@ -42,9 +46,20 @@ export async function inspectMcpRequest(request: Request): Promise<McpRequestInf
       && typeof (params as Record<string, unknown>).name === "string"
       ? (params as Record<string, unknown>).name as string
       : null;
-    return { rpcMethod, toolName };
+    const argumentsValue = params && typeof params === "object"
+      ? (params as Record<string, unknown>).arguments
+      : undefined;
+    const argumentsRecord = argumentsValue && typeof argumentsValue === "object"
+      ? argumentsValue as Record<string, unknown>
+      : null;
+    const explicitWorkspace = argumentsRecord && typeof argumentsRecord.workspace === "string"
+      ? argumentsRecord.workspace
+      : toolName === "use_workspace" && argumentsRecord && typeof argumentsRecord.name === "string"
+        ? argumentsRecord.name
+        : null;
+    return { rpcMethod, toolName, explicitWorkspace };
   } catch {
-    return { rpcMethod: null, toolName: null };
+    return { rpcMethod: null, toolName: null, explicitWorkspace: null };
   }
 }
 

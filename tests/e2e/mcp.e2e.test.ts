@@ -17,6 +17,7 @@ interface LaunchedProcess {
 interface TraceEvent {
   rpcMethod: string | null;
   toolName: string | null;
+  explicitWorkspace: string | null;
   incomingSessionId: string | null;
   outgoingSessionId: string | null;
   transportSessionId: string | null;
@@ -24,6 +25,9 @@ interface TraceEvent {
   route: string;
   workspaceBindingBefore: string | null;
   workspaceBindingAfter: string | null;
+  sessionWorkspace: string | null;
+  resolvedWorkspace: string | null;
+  resolutionSource: string;
 }
 
 function launchCli(args: string[], coderelayHome: string, extraEnv: Record<string, string> = {}): LaunchedProcess {
@@ -218,8 +222,26 @@ describe("CodeRelay workspace-session router", () => {
       const workspaces = JSON.parse(toolText(await mcpCall(first.session, "tools/call", { name: "list_workspaces", arguments: {} })));
       expect(workspaces.map((workspace: { name: string }) => workspace.name)).toEqual(["attendance", "docseek"]);
 
-      await mcpCall(first.session, "tools/call", { name: "use_workspace", arguments: { name: "attendance" } });
+      const firstBinding = JSON.parse(toolText(await mcpCall(first.session, "tools/call", { name: "use_workspace", arguments: { name: "attendance" } })));
+      expect(firstBinding.chat_binding).toBe("attendance");
+      expect(firstBinding.instruction).toContain('workspace="attendance"');
       await mcpCall(second.session, "tools/call", { name: "use_workspace", arguments: { name: "docseek" } });
+
+      const explicitCrossSessionRead = await mcpCall(second.session, "tools/call", {
+        name: "read_file",
+        arguments: { workspace: "attendance", path: "src/project.txt" }
+      });
+      expect(toolText(explicitCrossSessionRead)).toContain("attendance workspace");
+      const explicitCurrent = JSON.parse(toolText(await mcpCall(second.session, "tools/call", {
+        name: "current_workspace",
+        arguments: { workspace: "attendance" }
+      })));
+      expect(explicitCurrent.name).toBe("attendance");
+      const cachedSecond = JSON.parse(toolText(await mcpCall(second.session, "tools/call", {
+        name: "current_workspace",
+        arguments: {}
+      })));
+      expect(cachedSecond.name).toBe("docseek");
 
       const [firstRead, secondRead] = await Promise.all([
         mcpCall(first.session, "tools/call", { name: "read_file", arguments: { path: "src/project.txt" } }),
@@ -238,10 +260,15 @@ describe("CodeRelay workspace-session router", () => {
       await expect(readFile(path.join(firstWorkspace, "src", "only-b.txt"), "utf8")).rejects.toThrow();
       await expect(readFile(path.join(secondWorkspace, "src", "only-a.txt"), "utf8")).rejects.toThrow();
 
-      const traversal = await mcpCall(first.session, "tools/call", { name: "read_file", arguments: { path: "../coderelay-e2e-docseek-unknown/secret.txt" } });
+      const traversal = await mcpCall(first.session, "tools/call", { name: "read_file", arguments: { workspace: "attendance", path: "../coderelay-e2e-docseek-unknown/secret.txt" } });
       expect(toolError(traversal)).toContain("inside the workspace");
-      const symlinkEscape = await mcpCall(first.session, "tools/call", { name: "read_file", arguments: { path: "linked-docseek/secret.txt" } });
+      const symlinkEscape = await mcpCall(first.session, "tools/call", { name: "read_file", arguments: { workspace: "attendance", path: "linked-docseek/secret.txt" } });
       expect(toolError(symlinkEscape)).toContain("outside the workspace");
+      const invalidWorkspace = await mcpCall(first.session, "tools/call", {
+        name: "read_file",
+        arguments: { workspace: secondWorkspace, path: "src/project.txt" }
+      });
+      expect(toolError(invalidWorkspace)).toContain("Workspace is not registered");
 
       await mcpCall(first.session, "tools/call", { name: "use_workspace", arguments: { name: "docseek" } });
       const switched = JSON.parse(toolText(await mcpCall(first.session, "tools/call", { name: "current_workspace", arguments: {} })));
@@ -266,10 +293,23 @@ describe("CodeRelay workspace-session router", () => {
       );
       expect(useWorkspaceTrace.route).toBe("existing");
       expect(useWorkspaceTrace.workspaceBindingBefore).toBeNull();
+      expect(useWorkspaceTrace.explicitWorkspace).toBe("attendance");
+      expect(useWorkspaceTrace.sessionWorkspace).toBeNull();
+      expect(useWorkspaceTrace.resolvedWorkspace).toBe("attendance");
+      expect(useWorkspaceTrace.resolutionSource).toBe("explicit");
       expect(currentWorkspaceTrace.route).toBe("existing");
       expect(currentWorkspaceTrace.workspaceBindingBefore).toBe("attendance");
       expect(currentWorkspaceTrace.internalSessionId).toBe(useWorkspaceTrace.internalSessionId);
       expect(currentWorkspaceTrace.transportSessionId).toBe(first.session.sessionId);
+
+      const explicitTrace = await waitForTraceEvent(runtime.serverLog, (event) =>
+        event.toolName === "read_file"
+        && event.incomingSessionId === second.session.sessionId
+        && event.explicitWorkspace === "attendance"
+        && event.resolutionSource === "explicit"
+      );
+      expect(explicitTrace.sessionWorkspace).toBe("docseek");
+      expect(explicitTrace.resolvedWorkspace).toBe("attendance");
 
       const stop = launchCli(["stop"], coderelayHome);
       expect((await stop.exit).code).toBe(0);
