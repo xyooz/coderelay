@@ -76,6 +76,14 @@ coderelay --no-tunnel
 
 The daemon and local MCP server remain available while a public tunnel is warming up. `coderelay status` and `coderelay doctor` distinguish the local MCP process, transport process, and public endpoint.
 
+For diagnosing MCP session behavior, start the daemon with request tracing enabled:
+
+```bash
+CODERELAY_MCP_TRACE=1 coderelay
+```
+
+The trace is written to the daemon server log under `~/.coderelay/daemon/logs/`. Each line records the JSON-RPC method, tool name, incoming and outgoing `Mcp-Session-Id`, transport session ID, internal session ID, route (`new`/`existing`/`missing`), and workspace binding before and after the request.
+
 ## Workspace registry
 
 ```bash
@@ -127,4 +135,3 @@ The E2E suite covers one daemon, two MCP sessions, independent workspace binding
 ## License
 
 MIT
-

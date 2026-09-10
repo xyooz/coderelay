@@ -14,10 +14,22 @@ interface LaunchedProcess {
   exit: Promise<{ code: number | null; stdout: string; stderr: string }>;
 }
 
-function launchCli(args: string[], coderelayHome: string): LaunchedProcess {
+interface TraceEvent {
+  rpcMethod: string | null;
+  toolName: string | null;
+  incomingSessionId: string | null;
+  outgoingSessionId: string | null;
+  transportSessionId: string | null;
+  internalSessionId: string | null;
+  route: string;
+  workspaceBindingBefore: string | null;
+  workspaceBindingAfter: string | null;
+}
+
+function launchCli(args: string[], coderelayHome: string, extraEnv: Record<string, string> = {}): LaunchedProcess {
   const child = spawn(process.execPath, [entryPoint, ...args], {
     cwd: projectRoot,
-    env: { ...process.env, CODERELAY_HOME: coderelayHome },
+    env: { ...process.env, CODERELAY_HOME: coderelayHome, ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"]
   });
   let stdout = "";
@@ -43,6 +55,29 @@ function launchCli(args: string[], coderelayHome: string): LaunchedProcess {
     },
     exit
   };
+}
+
+async function waitForTraceEvent(
+  logPath: string,
+  predicate: (event: TraceEvent) => boolean,
+  timeoutMs = 5_000
+): Promise<TraceEvent> {
+  const prefix = "[CodeRelay MCP trace] ";
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const events = (await readFile(logPath, "utf8"))
+        .split(/\r?\n/u)
+        .filter((line) => line.startsWith(prefix))
+        .map((line) => JSON.parse(line.slice(prefix.length)) as TraceEvent);
+      const match = events.find(predicate);
+      if (match) return match;
+    } catch {
+      // The detached server may not have created or flushed its log yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for an MCP trace event in ${logPath}`);
 }
 
 async function waitForPath(filePath: string, timeoutMs = 30_000): Promise<void> {
@@ -128,7 +163,7 @@ function toolError(payload: Record<string, any>): string {
 }
 
 describe("CodeRelay workspace-session router", () => {
-  it("serves two isolated workspaces through one daemon and one endpoint", async () => {
+  it("preserves a workspace binding across requests using the initialize response session id", async () => {
     const firstWorkspace = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-attendance-"));
     const secondWorkspace = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-docseek-"));
     const coderelayHome = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-home-"));
@@ -151,7 +186,7 @@ describe("CodeRelay workspace-session router", () => {
       expect((await addSecond.exit).code).toBe(0);
 
       const testPort = 20_000 + Math.floor(Math.random() * 5_000);
-      const start = launchCli(["start", "--port", String(testPort), "--no-tunnel"], coderelayHome);
+      const start = launchCli(["start", "--port", String(testPort), "--no-tunnel"], coderelayHome, { CODERELAY_MCP_TRACE: "1" });
       const output = await start.waitForOutput("Local MCP server ready");
       expect((await start.exit).code).toBe(0);
       const endpoint = output.match(/http:\/\/127\.0\.0\.1:\d+\/mcp\/[^\s]+/u)?.[0];
@@ -212,6 +247,29 @@ describe("CodeRelay workspace-session router", () => {
       const switched = JSON.parse(toolText(await mcpCall(first.session, "tools/call", { name: "current_workspace", arguments: {} })));
       expect(switched.name).toBe("docseek");
       expect(toolText(await mcpCall(first.session, "tools/call", { name: "read_file", arguments: { path: "secret.txt" } }))).toContain("must stay in docseek");
+
+      const runtime = JSON.parse(await readFile(path.join(coderelayHome, "daemon", "runtime.json"), "utf8")) as { serverLog: string };
+      const initializeTrace = await waitForTraceEvent(runtime.serverLog, (event) => event.rpcMethod === "initialize" && event.route === "new");
+      expect(initializeTrace.incomingSessionId).toBeNull();
+      expect(initializeTrace.outgoingSessionId).toBe(first.session.sessionId);
+      expect(initializeTrace.transportSessionId).toBe(first.session.sessionId);
+
+      const useWorkspaceTrace = await waitForTraceEvent(runtime.serverLog, (event) =>
+        event.toolName === "use_workspace"
+        && event.incomingSessionId === first.session.sessionId
+        && event.workspaceBindingAfter === "attendance"
+      );
+      const currentWorkspaceTrace = await waitForTraceEvent(runtime.serverLog, (event) =>
+        event.toolName === "current_workspace"
+        && event.incomingSessionId === first.session.sessionId
+        && event.workspaceBindingAfter === "attendance"
+      );
+      expect(useWorkspaceTrace.route).toBe("existing");
+      expect(useWorkspaceTrace.workspaceBindingBefore).toBeNull();
+      expect(currentWorkspaceTrace.route).toBe("existing");
+      expect(currentWorkspaceTrace.workspaceBindingBefore).toBe("attendance");
+      expect(currentWorkspaceTrace.internalSessionId).toBe(useWorkspaceTrace.internalSessionId);
+      expect(currentWorkspaceTrace.transportSessionId).toBe(first.session.sessionId);
 
       const stop = launchCli(["stop"], coderelayHome);
       expect((await stop.exit).code).toBe(0);

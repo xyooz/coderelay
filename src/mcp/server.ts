@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { WorkspaceSessionManager } from "./session.js";
+import { inspectMcpRequest, waitForMcpResponse, writeMcpTrace, type McpRequestInfo, type McpTraceEvent } from "./tracing.js";
 import { createMcpServer } from "./tools.js";
 import { WorkspaceRegistry } from "../workspace/registry.js";
 import { CODERELAY_HOME } from "../runtime/state.js";
@@ -74,14 +75,51 @@ class StatefulMcpHandler {
   ) {}
 
   async fetch(request: Request): Promise<Response> {
-    if (this.closed) return sessionNotFound();
+    const requestInfo = await inspectMcpRequest(request);
+    if (this.closed) {
+      const response = sessionNotFound();
+      writeMcpTrace(this.traceEvent(request, requestInfo, {
+        internalSessionId: null,
+        route: "closed",
+        workspaceBindingBefore: null,
+        workspaceBindingAfter: null,
+        transportSessionId: null,
+        outgoingSessionId: response.headers.get("mcp-session-id")
+      }));
+      return response;
+    }
+
     const externalId = request.headers.get("mcp-session-id");
     if (externalId) {
       const entry = this.entries.get(externalId);
-      if (!entry) return sessionNotFound();
-      return await entry.transport.handleRequest(request);
+      if (!entry) {
+        const response = sessionNotFound();
+        writeMcpTrace(this.traceEvent(request, requestInfo, {
+          internalSessionId: null,
+          route: "missing",
+          workspaceBindingBefore: null,
+          workspaceBindingAfter: null,
+          transportSessionId: null,
+          outgoingSessionId: response.headers.get("mcp-session-id")
+        }));
+        return response;
+      }
+
+      const bindingBefore = this.sessions.current(entry.internalId);
+      const response = await entry.transport.handleRequest(request);
+      await waitForMcpResponse(response);
+      writeMcpTrace(this.traceEvent(request, requestInfo, {
+        internalSessionId: entry.internalId,
+        route: "existing",
+        workspaceBindingBefore: bindingBefore ?? null,
+        workspaceBindingAfter: this.sessions.current(entry.internalId) ?? null,
+        transportSessionId: entry.transport.sessionId ?? null,
+        outgoingSessionId: response.headers.get("mcp-session-id")
+      }));
+      return response;
     }
-    return await this.createSession(request);
+
+    return await this.createSession(request, requestInfo);
   }
 
   async close(): Promise<void> {
@@ -101,7 +139,7 @@ class StatefulMcpHandler {
     return this.entries.size;
   }
 
-  private async createSession(request: Request): Promise<Response> {
+  private async createSession(request: Request, requestInfo: McpRequestInfo): Promise<Response> {
     const internalId = randomUUID();
     let externalId: string | undefined;
     const transport = new WebStandardStreamableHTTPServerTransport({
@@ -124,9 +162,18 @@ class StatefulMcpHandler {
     try {
       await product.connect(transport);
       const response = await transport.handleRequest(request);
+      await waitForMcpResponse(response);
       // The initialization callback runs before handleRequest resolves. Keep
       // this defensive registration for SDK versions that defer the callback.
       if (transport.sessionId && !this.entries.has(transport.sessionId)) this.entries.set(transport.sessionId, entry);
+      writeMcpTrace(this.traceEvent(request, requestInfo, {
+        internalSessionId: internalId,
+        route: "new",
+        workspaceBindingBefore: null,
+        workspaceBindingAfter: this.sessions.current(internalId) ?? null,
+        transportSessionId: transport.sessionId ?? null,
+        outgoingSessionId: response.headers.get("mcp-session-id")
+      }));
       return response;
     } catch (error) {
       this.sessions.clear(internalId);
@@ -139,6 +186,20 @@ class StatefulMcpHandler {
   private removeSession(externalId: string, internalId: string): void {
     this.entries.delete(externalId);
     this.sessions.clear(internalId);
+  }
+
+  private traceEvent(
+    request: Request,
+    requestInfo: McpRequestInfo,
+    state: Omit<McpTraceEvent, "httpMethod" | "rpcMethod" | "toolName" | "incomingSessionId">
+  ): McpTraceEvent {
+    return {
+      httpMethod: request.method,
+      rpcMethod: requestInfo.rpcMethod,
+      toolName: requestInfo.toolName,
+      incomingSessionId: request.headers.get("mcp-session-id"),
+      ...state
+    };
   }
 }
 
@@ -222,4 +283,3 @@ export async function runMcpServer(options: ServeOptions): Promise<void> {
   });
   console.error(`CodeRelay daemon listening on http://${options.host}:${options.port}${running.endpointPath}`);
 }
-
