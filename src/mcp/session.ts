@@ -39,12 +39,26 @@ export class WorkspaceSessionManager {
 
   /** Drop bindings revoked by the local CLI, including remove-and-re-register cycles. */
   async prune(registry: WorkspaceRegistry): Promise<number> {
-    const entries = await registry.describeAll();
-    const current = new Map(entries.filter((entry) => entry.exists).map((entry) => [entry.id, entry]));
+    const referencedWorkspaceIds = new Set([...this.bindings.values()].map((binding) => binding.workspaceId));
+    if (referencedWorkspaceIds.size === 0) return 0;
+
+    const entries = await registry.list();
+    const current = new Map(entries.filter((entry) => referencedWorkspaceIds.has(entry.id)).map((entry) => [entry.id, entry]));
+    const usable = new Map<string, boolean>();
     let cleared = 0;
     for (const [sessionId, binding] of this.bindings) {
       const entry = current.get(binding.workspaceId);
       if (!entry || entry.addedAt !== binding.workspaceAddedAt) {
+        this.bindings.delete(sessionId);
+        cleared += 1;
+        continue;
+      }
+      let entryUsable = usable.get(entry.id);
+      if (entryUsable === undefined) {
+        entryUsable = await registry.isUsable(entry);
+        usable.set(entry.id, entryUsable);
+      }
+      if (!entryUsable) {
         this.bindings.delete(sessionId);
         cleared += 1;
       }

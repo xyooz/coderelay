@@ -125,15 +125,19 @@ export class WorkspaceRegistry {
     return entry;
   }
 
-  async describe(entry: RegisteredWorkspace): Promise<WorkspaceDescriptor> {
-    let exists = false;
+  /** Check only the canonical root; unlike describe(), this never loads project context files. */
+  async isUsable(entry: RegisteredWorkspace): Promise<boolean> {
     try {
       const currentRoot = await fs.realpath(entry.root);
       const stats = await fs.stat(currentRoot);
-      exists = stats.isDirectory() && currentRoot === entry.root;
+      return stats.isDirectory() && currentRoot === entry.root;
     } catch {
-      exists = false;
+      return false;
     }
+  }
+
+  async describe(entry: RegisteredWorkspace): Promise<WorkspaceDescriptor> {
+    const exists = await this.isUsable(entry);
     return {
       ...entry,
       exists,

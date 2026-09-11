@@ -1,7 +1,7 @@
 import { mkdtemp, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ApprovalManager } from "../src/approval/manager.js";
 import { WorkspaceSessionManager } from "../src/mcp/session.js";
 import { PolicyStore } from "../src/policy/store.js";
@@ -84,6 +84,26 @@ describe("workspace management", () => {
       await rm(setupState.home, { recursive: true, force: true });
       await rm(setupState.workspace, { recursive: true, force: true });
       await rm(moved, { recursive: true, force: true });
+    }
+  });
+
+  it("prunes only active bindings without loading AGENTS context", async () => {
+    const setupState = await setup();
+    try {
+      await writeFile(path.join(setupState.workspace, "AGENTS.md"), "This file must not be loaded during prune.\n");
+      const describeAll = vi.spyOn(setupState.registry, "describeAll").mockRejectedValue(new Error("AGENTS scan should not run"));
+      const sessions = new WorkspaceSessionManager();
+
+      expect(await sessions.prune(setupState.registry)).toBe(0);
+      expect(describeAll).not.toHaveBeenCalled();
+
+      sessions.bind("session-a", setupState.entry);
+      expect(await sessions.prune(setupState.registry)).toBe(0);
+      expect(sessions.current("session-a")).toBe(setupState.entry.id);
+      expect(describeAll).not.toHaveBeenCalled();
+    } finally {
+      await rm(setupState.home, { recursive: true, force: true });
+      await rm(setupState.workspace, { recursive: true, force: true });
     }
   });
 });
