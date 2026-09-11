@@ -78,6 +78,7 @@ class StatefulMcpHandler {
 
   async fetch(request: Request): Promise<Response> {
     const requestInfo = await inspectMcpRequest(request);
+    await this.sessions.prune(this.registry).catch(() => undefined);
     if (this.closed) {
       const response = sessionNotFound();
       await this.writeTrace(request, requestInfo, {

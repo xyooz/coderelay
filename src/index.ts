@@ -8,6 +8,7 @@ import {
   endpointCommand,
   listCommand,
   removeWorkspaceCommand,
+  pruneCommand,
   restartCommand,
   rotateEndpointCommand,
   serveCommand,
@@ -82,6 +83,11 @@ program
   .command("workspaces")
   .description("List registered workspaces")
   .action(workspacesCommand);
+
+program
+  .command("prune")
+  .description("Remove stale workspaces and revoke their local authorization")
+  .action(pruneCommand);
 
 program
   .command("stop")
@@ -180,7 +186,7 @@ policy.command("list").action(policyListCommand);
 policy.command("remove").argument("<id>", "policy rule id").action(policyRemoveCommand);
 
 const args = process.argv.slice(2);
-const commands = new Set(["start", "setup", "serve", "auth", "add", "remove", "workspaces", "stop", "status", "list", "doctor", "endpoint", "restart", "config", "trust", "untrust", "approve", "deny", "policy"]);
+const commands = new Set(["start", "setup", "serve", "auth", "add", "remove", "workspaces", "prune", "stop", "status", "list", "doctor", "endpoint", "restart", "config", "trust", "untrust", "approve", "deny", "policy"]);
 if (args.length === 0) args.push("start");
 else if (!commands.has(args[0]) && !["--help", "-h", "--version", "-V"].includes(args[0])) args.unshift("start");
 

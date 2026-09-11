@@ -1,9 +1,12 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { describe, expect, it } from "vitest";
+import { ApprovalManager } from "../../src/approval/manager.js";
+import { PolicyStore } from "../../src/policy/store.js";
+import { WorkspaceRegistry } from "../../src/workspace/registry.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const entryPoint = path.join(projectRoot, "dist", "index.js");
@@ -370,4 +373,115 @@ describe("CodeRelay workspace-session router", () => {
       await rm(outside, { recursive: true, force: true });
     }
   }, 90_000);
+});
+
+describe("CodeRelay workspace lifecycle", () => {
+  it("starts with an empty registry without implicitly authorizing cwd", async () => {
+    const coderelayHome = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-empty-registry-home-"));
+    try {
+      const port = 25_000 + Math.floor(Math.random() * 5_000);
+      const start = launchCli(["start", "--port", String(port), "--no-tunnel"], coderelayHome);
+      const output = await start.waitForOutput("No workspaces registered.");
+      expect(output).toContain("coderelay add .");
+      expect((await start.exit).code).toBe(0);
+      expect(await new WorkspaceRegistry(coderelayHome).list()).toEqual([]);
+
+      const stop = launchCli(["stop"], coderelayHome);
+      expect((await stop.exit).code).toBe(0);
+    } finally {
+      await rm(coderelayHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("removes only the registry entry and all workspace authorization state", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-remove-workspace-"));
+    const coderelayHome = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-remove-home-"));
+    try {
+      const marker = path.join(workspace, "must-survive.txt");
+      await writeFile(marker, "keep me\n");
+      const add = launchCli(["add", workspace, "--name", "project-a"], coderelayHome);
+      expect((await add.exit).code).toBe(0);
+
+      const registry = new WorkspaceRegistry(coderelayHome);
+      const entry = await registry.get("project-a");
+      expect(entry).toBeTruthy();
+      const policy = new PolicyStore(coderelayHome);
+      await policy.trust(entry!);
+      await policy.addWorkspaceRule(entry!, [{ program: "git", args: ["push", "origin", "main"] }, { program: "npm", args: ["test"] }]);
+      const approvals = new ApprovalManager(coderelayHome);
+      await approvals.create({
+        workspace: entry!.id,
+        commands: [{ program: "rm", args: ["-rf", "dist"] }],
+        stopOnError: true,
+        timeoutMs: 30_000,
+        risk: { level: "high", categories: ["destructive"], reasons: ["test"], hardDeny: false },
+        mode: "safe"
+      });
+
+      const remove = launchCli(["remove", "project-a"], coderelayHome);
+      const removed = await remove.exit;
+      expect(removed.code).toBe(0);
+      expect(removed.stdout).toContain("Unregistered workspace project-a.");
+      expect(removed.stdout).toContain("Local files were not deleted.");
+      expect(removed.stdout).toContain("Removed trust, 2 policy rules and 1 pending approval.");
+      await expect(stat(marker)).resolves.toBeTruthy();
+      expect(await registry.list()).toEqual([]);
+      expect(await policy.listRules()).toEqual([]);
+      expect(await approvals.list()).toEqual([]);
+
+      const reAdd = launchCli(["add", workspace, "--name", "project-a"], coderelayHome);
+      expect((await reAdd.exit).code).toBe(0);
+      const reRegistered = await registry.get("project-a");
+      expect(reRegistered).toBeTruthy();
+      expect(await policy.isTrusted(reRegistered!)).toBe(false);
+      expect(await policy.listRules()).toEqual([]);
+      expect(await approvals.list()).toEqual([]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(coderelayHome, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("prunes stale roots and revokes their authorization without deleting moved files", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-prune-workspace-"));
+    const moved = `${workspace}-moved`;
+    const coderelayHome = await mkdtemp(path.join(os.tmpdir(), "coderelay-e2e-prune-home-"));
+    try {
+      const marker = path.join(workspace, "must-survive.txt");
+      await writeFile(marker, "keep me too\n");
+      const add = launchCli(["add", workspace, "--name", "stale-project"], coderelayHome);
+      expect((await add.exit).code).toBe(0);
+      const registry = new WorkspaceRegistry(coderelayHome);
+      const entry = await registry.get("stale-project");
+      expect(entry).toBeTruthy();
+      const policy = new PolicyStore(coderelayHome);
+      await policy.trust(entry!);
+      await policy.addWorkspaceRule(entry!, [{ program: "npm", args: ["run", "build"] }]);
+      const approvals = new ApprovalManager(coderelayHome);
+      await approvals.create({
+        workspace: entry!.id,
+        commands: [{ program: "git", args: ["push", "origin", "main"] }],
+        stopOnError: true,
+        timeoutMs: 30_000,
+        risk: { level: "high", categories: ["network"], reasons: ["test"], hardDeny: false },
+        mode: "safe"
+      });
+      await rename(workspace, moved);
+
+      const prune = launchCli(["prune"], coderelayHome);
+      const pruned = await prune.exit;
+      expect(pruned.code).toBe(0);
+      expect(pruned.stdout).toContain("Pruned workspace stale-project.");
+      expect(pruned.stdout).toContain("Local files were not deleted.");
+      expect(pruned.stdout).toContain("Removed trust, 1 policy rule and 1 pending approval.");
+      await expect(stat(path.join(moved, "must-survive.txt"))).resolves.toBeTruthy();
+      expect(await registry.list()).toEqual([]);
+      expect(await policy.listRules()).toEqual([]);
+      expect(await approvals.list()).toEqual([]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(moved, { recursive: true, force: true });
+      await rm(coderelayHome, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

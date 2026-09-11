@@ -22,6 +22,11 @@ interface PolicyFile {
   rules: PolicyRule[];
 }
 
+export interface WorkspacePolicyCleanup {
+  trustRemoved: boolean;
+  rulesRemoved: number;
+}
+
 export function policyDirectory(home: string): string {
   return path.join(home, "policies");
 }
@@ -107,6 +112,24 @@ export class PolicyStore {
     const data = await this.read();
     data.trustedWorkspaces = data.trustedWorkspaces.filter((entry) => entry !== workspace.id && entry !== workspace.name);
     await this.write(data);
+  }
+
+  /** Revoke every persisted authorization reference for one workspace. */
+  async removeWorkspace(workspace: RegisteredWorkspace): Promise<WorkspacePolicyCleanup> {
+    const data = await this.read();
+    const identifiers = new Set([workspace.id, workspace.name]);
+    const trustedBefore = data.trustedWorkspaces.length;
+    const rulesBefore = data.rules.length;
+    data.trustedWorkspaces = data.trustedWorkspaces.filter((entry) => !identifiers.has(entry));
+    data.rules = data.rules.filter((rule) => !identifiers.has(rule.workspace));
+
+    if (data.trustedWorkspaces.length !== trustedBefore || data.rules.length !== rulesBefore) {
+      await this.write(data);
+    }
+    return {
+      trustRemoved: data.trustedWorkspaces.length !== trustedBefore,
+      rulesRemoved: rulesBefore - data.rules.length
+    };
   }
 
   async addWorkspaceRule(workspace: RegisteredWorkspace, commands: StructuredCommand[]): Promise<PolicyRule[]> {

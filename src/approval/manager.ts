@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import type { CommandPolicyMode, StructuredCommand } from "../command/model.js";
 import { assertNoInlineSecrets, commandFingerprint } from "../command/model.js";
 import type { RiskAssessment, RiskLevel, RiskCategory } from "../risk/analyzer.js";
+import type { RegisteredWorkspace } from "../workspace/registry.js";
 
 export interface ApprovalRisk {
   level: RiskLevel;
@@ -118,6 +119,16 @@ export class ApprovalManager {
     return request ?? null;
   }
 
+  /** Remove every pending approval that belongs to one workspace. */
+  async removeWorkspace(workspace: RegisteredWorkspace): Promise<number> {
+    const file = await this.read();
+    const identifiers = new Set([workspace.id, workspace.name]);
+    const remaining = file.requests.filter((request) => !identifiers.has(request.workspace));
+    const removed = file.requests.length - remaining.length;
+    if (removed > 0) await this.write({ version: 1, requests: remaining });
+    return removed;
+  }
+
   async remove(requestId: string): Promise<ApprovalRequest | null> {
     const file = await this.read();
     const index = file.requests.findIndex((request) => request.request_id === requestId);
@@ -160,4 +171,3 @@ export function riskForApproval(assessments: RiskAssessment[]): ApprovalRisk {
     hardDeny: assessments.some((assessment) => assessment.hardDeny)
   };
 }
-

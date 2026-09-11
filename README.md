@@ -17,12 +17,20 @@ coderelay
 
 ## Quick start
 
-Register projects once:
+Register projects once. Registration is explicit local authorization; starting CodeRelay never silently registers the current directory:
 
 ```bash
 coderelay add ~/Projects/attendance
 coderelay add ~/Projects/docseek
 coderelay workspaces
+```
+
+If the registry is empty, `coderelay` still starts the daemon but prints the next local step:
+
+```text
+No workspaces registered.
+Register one with:
+  coderelay add .
 ```
 
 Start the single daemon:
@@ -186,6 +194,7 @@ The trace is written to the daemon server log under `~/.coderelay/daemon/logs/`.
 coderelay add <path> [--name <name>]
 coderelay remove <name>
 coderelay workspaces
+coderelay prune
 coderelay status
 coderelay stop
 coderelay restart
@@ -199,6 +208,8 @@ Names default to the directory name. Collisions receive `-2`, `-3`, and so on. T
 ```text
 ~/.coderelay/workspaces.json
 ```
+
+`coderelay remove` and `coderelay prune` revoke trust, persisted workspace approval rules, and pending approvals before removing the registry entry. They never delete files in the real workspace directory. `prune` targets roots that no longer exist or whose canonical path changed. Workspace lifecycle changes are local CLI operations; the MCP server only exposes `list_workspaces`, `use_workspace`, and `current_workspace` for workspace selection.
 
 The daemon runtime and logs are kept outside projects:
 

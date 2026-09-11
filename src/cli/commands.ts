@@ -1,7 +1,7 @@
 import { appendFile } from "node:fs/promises";
 import path from "node:path";
 import { detectWorkspace } from "../workspace/detect.js";
-import { WorkspaceRegistry } from "../workspace/registry.js";
+import { WorkspaceRegistry, type RegisteredWorkspace } from "../workspace/registry.js";
 import { runMcpServer } from "../mcp/server.js";
 import { CloudflaredTunnelProvider } from "../tunnel/cloudflared.js";
 import { CloudflareNamedTunnelProvider } from "../tunnel/cloudflare-named.js";
@@ -176,6 +176,11 @@ function printProjectDetection(info: Awaited<ReturnType<typeof detectWorkspace>>
 function printReadyMessage(state: RuntimeState, workspaceCount: number): void {
   console.log(`  ✓ CodeRelay daemon: ${state.instanceName}`);
   console.log(`  ✓ Registered workspaces: ${workspaceCount}`);
+  if (workspaceCount === 0) {
+    console.log("\nNo workspaces registered.");
+    console.log("Register one with:");
+    console.log("  coderelay add .");
+  }
   console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   if (state.transportProvider === "openai") {
     console.log(state.transportState === "ready" ? "Secure connection ready" : "Local MCP is ready; the Secure connection is still warming up.");
@@ -213,12 +218,6 @@ export async function startCommand(options: StartOptions = {}): Promise<void> {
   if (requestedWorkspace) {
     const info = await detectWorkspace(requestedWorkspace);
     const entry = await registry.add(info.root, options.name);
-    entries = await registry.list();
-    printProjectDetection(info);
-    console.log(`  ✓ Workspace registered: ${entry.name}`);
-  } else if (entries.length === 0) {
-    const info = await detectWorkspace(process.cwd());
-    const entry = await registry.add(info.root);
     entries = await registry.list();
     printProjectDetection(info);
     console.log(`  ✓ Workspace registered: ${entry.name}`);
@@ -551,10 +550,11 @@ function displayPath(workspace: string): string {
 export async function workspacesCommand(): Promise<void> {
   const registry = new WorkspaceRegistry(CODERELAY_HOME);
   const entries = await registry.describeAll();
-  console.log("NAME\tWORKSPACE\tSTATUS\tAGENTS");
+  const policy = new PolicyStore(CODERELAY_HOME);
+  console.log("NAME\tWORKSPACE\tSTATUS\tAGENTS\tTRUST");
   for (const entry of entries) {
     const agents = [entry.agents.md ? "AGENTS.md" : "", entry.agents.overrideMd ? "AGENTS.override.md" : ""].filter(Boolean).join(",") || "-";
-    console.log(`${entry.name}\t${displayPath(entry.root)}\t${entry.exists ? "ready" : "unavailable"}\t${agents}`);
+    console.log(`${entry.name}\t${displayPath(entry.root)}\t${entry.exists ? "ready" : "unavailable"}\t${agents}\t${await policy.isTrusted(entry) ? "trusted" : "untrusted"}`);
   }
   if (entries.length === 0) console.log("(none)");
 }
@@ -571,10 +571,54 @@ export async function addWorkspaceCommand(workspace: string, name?: string): Pro
   console.log(`Registry: ${registry.filePath}`);
 }
 
+interface WorkspaceCleanupSummary {
+  trustRemoved: boolean;
+  rulesRemoved: number;
+  approvalsRemoved: number;
+}
+
+/**
+ * Revoke all workspace authorization before removing the registry entry.
+ * If any cleanup step throws, the registry entry remains available for repair.
+ */
+async function unregisterWorkspace(registry: WorkspaceRegistry, entry: RegisteredWorkspace): Promise<WorkspaceCleanupSummary> {
+  const policy = await new PolicyStore(CODERELAY_HOME).removeWorkspace(entry);
+  const approvalsRemoved = await new ApprovalManager(CODERELAY_HOME).removeWorkspace(entry);
+  await registry.removeEntry(entry);
+  return { ...policy, approvalsRemoved };
+}
+
+function countLabel(count: number, singular: string): string {
+  return `${count} ${singular}${count === 1 ? "" : "s"}`;
+}
+
+function printUnregistered(entry: RegisteredWorkspace, summary: WorkspaceCleanupSummary, verb: "Unregistered" | "Pruned"): void {
+  console.log(`${verb} workspace ${entry.name}.`);
+  console.log("Local files were not deleted.");
+  console.log(`Removed trust, ${countLabel(summary.rulesRemoved, "policy rule")} and ${countLabel(summary.approvalsRemoved, "pending approval")}.`);
+}
+
 export async function removeWorkspaceCommand(name: string): Promise<void> {
   const registry = new WorkspaceRegistry(CODERELAY_HOME);
-  const entry = await registry.remove(name);
-  console.log(`Removed workspace ${entry.name}.`);
+  const entry = await registry.get(name);
+  if (!entry) throw new Error(`Workspace is not registered: ${name}`);
+  const summary = await unregisterWorkspace(registry, entry);
+  printUnregistered(entry, summary, "Unregistered");
+}
+
+export async function pruneCommand(): Promise<void> {
+  const registry = new WorkspaceRegistry(CODERELAY_HOME);
+  const stale = (await registry.describeAll()).filter((entry) => !entry.exists);
+  if (stale.length === 0) {
+    console.log("No stale workspaces found.");
+    return;
+  }
+
+  for (const entry of stale) {
+    const summary = await unregisterWorkspace(registry, entry);
+    printUnregistered(entry, summary, "Pruned");
+  }
+  console.log(`Pruned ${countLabel(stale.length, "stale workspace")}.`);
 }
 
 export async function doctorCommand(): Promise<void> {

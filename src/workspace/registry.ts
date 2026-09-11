@@ -115,6 +115,11 @@ export class WorkspaceRegistry {
   async remove(nameOrId: string): Promise<RegisteredWorkspace> {
     const entry = await this.get(nameOrId);
     if (!entry) throw new Error(`Workspace is not registered: ${nameOrId}`);
+    return await this.removeEntry(entry);
+  }
+
+  /** Remove exactly this registry entry after its external authorization is revoked. */
+  async removeEntry(entry: RegisteredWorkspace): Promise<RegisteredWorkspace> {
     const remaining = (await this.list()).filter((candidate) => candidate.id !== entry.id);
     await this.write(remaining);
     return entry;
@@ -162,4 +167,3 @@ export class WorkspaceRegistry {
     await fs.rename(temporaryPath, this.filePath);
   }
 }
-
