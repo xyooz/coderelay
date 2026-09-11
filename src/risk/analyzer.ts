@@ -45,7 +45,7 @@ function hasInlineCode(command: StructuredCommand, program: string): boolean {
 
 function isRootDestructive(command: StructuredCommand, program: string): boolean {
   if (program === "rm") {
-    const recursive = command.args.some((arg) => /^-/u.test(arg) && arg.includes("r"));
+    const recursive = command.args.some((arg) => /^-/u.test(arg) && arg.toLowerCase().includes("r"));
     const targets = command.args.filter((arg) => !arg.startsWith("-"));
     return recursive && targets.some((target) => target === "/" || target === "/*" || target === "~" || target === "~/");
   }

@@ -39,7 +39,7 @@ describe("OpenAI Secure MCP transport", () => {
     try {
       delete process.env.CONTROL_PLANE_API_KEY;
       delete process.env.CONTROL_PLANE_TUNNEL_ID;
-      const provider = await selectTransport("auto", context);
+      const provider = await selectTransport("auto", { ...context, openaiTunnelId: undefined });
       expect(provider.name).toBe("cloudflare-quick");
     } finally {
       if (previousKey === undefined) delete process.env.CONTROL_PLANE_API_KEY;
@@ -58,11 +58,12 @@ describe("OpenAI Secure MCP transport", () => {
 
   it("only reports complete OpenAI configuration when both tunnel ID and API key exist", () => {
     const previousKey = process.env.CONTROL_PLANE_API_KEY;
+    const isolatedCredentialsPath = path.join(os.tmpdir(), `coderelay-no-openai-credentials-${process.pid}-${Date.now()}.json`);
     try {
       delete process.env.CONTROL_PLANE_API_KEY;
-      expect(hasOpenAiConfiguration(context)).toBe(false);
+      expect(hasOpenAiConfiguration(context, isolatedCredentialsPath)).toBe(false);
       process.env.CONTROL_PLANE_API_KEY = "test-runtime-key";
-      expect(hasOpenAiConfiguration(context)).toBe(true);
+      expect(hasOpenAiConfiguration(context, isolatedCredentialsPath)).toBe(true);
     } finally {
       if (previousKey === undefined) delete process.env.CONTROL_PLANE_API_KEY;
       else process.env.CONTROL_PLANE_API_KEY = previousKey;

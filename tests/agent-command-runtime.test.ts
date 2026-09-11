@@ -104,6 +104,79 @@ describe("Agent Command Runtime", () => {
     }
   });
 
+  it("keeps legacy and structured commands on the same validation, risk, and policy path", async () => {
+    const setup = await setupWorkspace();
+    try {
+      const runtime = new AgentCommandRuntime({ home: setup.home, mode: "safe" });
+      const compare = async (legacy: string, structured: { program: string; args: string[] }) => {
+        const legacyResult = await runtime.run(setup.entry, { command: legacy });
+        const structuredResult = await runtime.run(setup.entry, { command: structured });
+        expect({
+          status: legacyResult.status,
+          risk: legacyResult.risk,
+          policy: legacyResult.policy
+        }).toEqual({
+          status: structuredResult.status,
+          risk: structuredResult.risk,
+          policy: structuredResult.policy
+        });
+      };
+
+      await compare("git push origin main", { program: "git", args: ["push", "origin", "main"] });
+      await compare("rm -rf dist", { program: "rm", args: ["-rf", "dist"] });
+
+      const unrestricted = new AgentCommandRuntime({ home: setup.home, mode: "unrestricted" });
+      const hardDenied = async (legacy: string, structured: { program: string; args: string[] }) => {
+        const legacyResult = await unrestricted.run(setup.entry, { command: legacy });
+        const structuredResult = await unrestricted.run(setup.entry, { command: structured });
+        expect(legacyResult).toMatchObject({ status: "denied", policy: { rule: "hard-deny" } });
+        expect(structuredResult).toMatchObject({ status: "denied", policy: { rule: "hard-deny" } });
+        expect(legacyResult.risk).toEqual(structuredResult.risk);
+      };
+      await hardDenied("rm -rf /", { program: "rm", args: ["-rf", "/"] });
+      await hardDenied("rm -rf /*", { program: "rm", args: ["-rf", "/*"] });
+      await hardDenied("rm -rf ~", { program: "rm", args: ["-rf", "~"] });
+      await hardDenied("rm -rf ~/", { program: "rm", args: ["-rf", "~/"] });
+      await hardDenied("shutdown now", { program: "shutdown", args: ["now"] });
+      await hardDenied("reboot", { program: "reboot", args: [] });
+      await hardDenied("mkfs /dev/disk0", { program: "mkfs", args: ["/dev/disk0"] });
+      await hardDenied("dd if=/dev/zero of=/dev/disk0", { program: "dd", args: ["if=/dev/zero", "of=/dev/disk0"] });
+
+      const rejected = async (run: () => Promise<unknown>): Promise<string> => {
+        try {
+          await run();
+          return "<unexpected success>";
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+      };
+      const rejectedCommands: Array<[string, { program: string; args: string[] }]> = [
+        ["rm -rf ../xxx", { program: "rm", args: ["-rf", "../xxx"] }],
+        ["bash -c 'echo unsafe'", { program: "bash", args: ["-c", "echo unsafe"] }],
+        ["sh --command 'echo unsafe'", { program: "sh", args: ["--command", "echo unsafe"] }],
+        ["cat /etc/passwd", { program: "cat", args: ["/etc/passwd"] }]
+      ];
+      for (const [legacy, structured] of rejectedCommands) {
+        const legacyError = await rejected(() => runtime.run(setup.entry, { command: legacy }));
+        const structuredError = await rejected(() => runtime.run(setup.entry, { command: structured }));
+        expect(legacyError).toBe(structuredError);
+        expect(legacyError).not.toBe("<unexpected success>");
+      }
+
+      for (const command of [
+        { program: "git", args: ["reset", "--hard"] },
+        { program: "git", args: ["clean", "-fd"] }
+      ]) {
+        const risk = analyzeCommand(command);
+        expect(risk.level).toBe("high");
+        expect(risk.categories).toEqual(expect.arrayContaining(["workspace-write", "destructive"]));
+      }
+    } finally {
+      await rm(setup.home, { recursive: true, force: true });
+      await rm(setup.workspace, { recursive: true, force: true });
+    }
+  });
+
   it("does not let project config widen policy and treats inline interpreters as high risk", async () => {
     const setup = await setupWorkspace();
     try {

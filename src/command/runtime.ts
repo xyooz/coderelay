@@ -1,7 +1,7 @@
 import type { RegisteredWorkspace } from "../workspace/registry.js";
-import { validateCommand, validateStructuredCommand, type ParsedCommand } from "../mcp/command-security.js";
+import { validateStructuredCommand, type ParsedCommand } from "../mcp/command-security.js";
 import { parseCommandRequest } from "./parser.js";
-import { assertNoInlineSecrets, commandFingerprint, commandDisplay, type CommandPolicyMode, type CommandRequestInput, type NormalizedCommandRequest, type StructuredCommand } from "./model.js";
+import { assertNoInlineSecrets, commandFingerprint, type CommandPolicyMode, type CommandRequestInput, type NormalizedCommandRequest, type StructuredCommand } from "./model.js";
 import { aggregateRisk, analyzeCommand, type RiskAssessment } from "../risk/analyzer.js";
 import { ApprovalManager, riskForApproval, type ApprovalRequest } from "../approval/manager.js";
 import { AuditLogger, type AuditRecord } from "../audit/logger.js";
@@ -94,6 +94,10 @@ export class AgentCommandRuntime {
       // which come from the user-owned ~/.coderelay configuration. A workspace
       // must never be able to widen the policy that protects it.
       const mode = this.options.mode ?? "safe";
+      // Catastrophic commands are denied by the shared risk layer before path
+      // validation can turn them into a legacy/structured-specific error.
+      // Every other command goes through the same validator before policy.
+      const parsed = aggregate.hardDeny ? undefined : this.validateCommands(normalized, workspace.root);
       const trusted = await this.policyStore.isTrusted(workspace);
       const fingerprint = commandFingerprint(normalized.commands, workspace.id, normalized.stopOnError, normalized.timeoutMs);
       const approvedOnce = await this.approvals.hasApprovedOnce(fingerprint);
@@ -131,7 +135,7 @@ export class AgentCommandRuntime {
       }
 
       if (approvedOnce) await this.approvals.consumeApprovedOnce(fingerprint);
-      const parsed = this.validateCommands(normalized, workspace.root);
+      if (!parsed) throw new Error("A hard-denied command reached execution.");
       const execution = await runSequential(workspace.root, parsed, normalized.timeoutMs, normalized.stopOnError, this.options.maxOutputBytes ?? 100_000);
       const result = this.successResult(workspace.name, normalized, aggregate, evaluation, execution.results, execution.stopped_on_error);
       await this.recordExecution(workspace.name, normalized, aggregate, evaluation, execution.results, result.approval);
@@ -153,10 +157,6 @@ export class AgentCommandRuntime {
   }
 
   private validateCommands(normalized: NormalizedCommandRequest, workspaceRoot: string): ParsedCommand[] {
-    if (normalized.legacy) {
-      const first = normalized.commands[0];
-      return [validateCommand(normalized.legacyCommand ?? commandDisplay(first), workspaceRoot)];
-    }
     return normalized.commands.map((command) => validateStructuredCommand(command, workspaceRoot));
   }
 
